@@ -17,7 +17,7 @@ c=(/usr/bin/clang -arch arm64 -mmacosx-version-min=13.0 -Wall -Wextra -Werror)
 /usr/bin/swiftc -parse-as-library -swift-version 5 -warnings-as-errors -target arm64-apple-macosx13.0 \
     -module-cache-path "$scratch/modules" -import-objc-header DPNativeBridge.h \
     "$scratch/DPUtun.o" "$scratch/DPHelper.o" -o "$app/Contents/MacOS/CampusVPN" \
-    DPControl.swift DPCampusPolicy.swift DPKernelSession.swift DPMenuApp.swift NetworkReport.swift CampusNotices.swift CampusOffice.swift CampusOfficeDirectory.swift DesktopAgenda.swift ReminderExport.swift YNUStudy.swift YNUWeek.swift \
+    DPControl.swift DPCampusPolicy.swift DPKernelSession.swift DPMenuApp.swift WorkbenchMark.swift NetworkReport.swift CampusNotices.swift CampusOffice.swift CampusOfficeDirectory.swift DesktopAgenda.swift ReminderExport.swift YNUStudy.swift YNUWeek.swift \
     YNUBrowserBridge.swift DPTCPTransport.swift DPIcmpProbe.swift DPPacketCodec.swift DPUdpProtocol.swift \
     DPUdpTransport.swift DPVirtualInterface.swift
 cp Info.plist "$app/Contents/"

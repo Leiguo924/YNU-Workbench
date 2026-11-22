@@ -44,26 +44,49 @@ struct NetworkReport: Sendable {
         return Double(data.count) * 8 / seconds / 1_000_000
     }
 
-    private static func probeCampus() async -> (code: Int?, milliseconds: Int?, route: String?) {
+    static func probeCampus(interface: String? = nil, timeout: Int = 6) async -> (code: Int?, milliseconds: Int?, route: String?) {
         let url = YNUBrowserBridge.portalIP
         let route = DPKernelSession.routeInterface(to: url.host ?? "")
+        if let interface, route != interface { return (nil, nil, route) }
         let probe = Process()
         let output = Pipe()
         probe.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-        probe.arguments = ["-q", "--noproxy", "*", "--silent", "--connect-timeout", "4",
-                           "--max-time", "6", "--output", "/dev/null",
-                           "--write-out", "%{http_code} %{time_starttransfer}", url.absoluteString]
+        let binding = interface.map { ["--interface", "if!" + $0] } ?? []
+        probe.arguments = ["-q", "--noproxy", "*", "--silent", "--connect-timeout", "3",
+                           "--max-time", String(timeout), "--output", "/dev/null",
+                           "--write-out", "%{http_code} %{time_starttransfer}"] + binding + [url.absoluteString]
         probe.standardOutput = output
         probe.standardError = FileHandle.nullDevice
         do { try probe.run() } catch { return (nil, nil, route) }
         let result = output.fileHandleForReading.readDataToEndOfFile()
         probe.waitUntilExit()
         let fields = String(decoding: result, as: UTF8.self).split(separator: " ")
-        guard fields.count == 2, let status = Int(fields[0]), (100..<600).contains(status),
+        guard probe.terminationStatus == 0, fields.count == 2, let status = Int(fields[0]), (200..<600).contains(status),
               let seconds = Double(fields[1]), seconds.isFinite, (0...10).contains(seconds) else {
             return (nil, nil, route)
         }
         return (status, Int((seconds * 1_000).rounded()), route)
+    }
+
+    static func pingCampus(_ address: String, interface: String) async -> Int? {
+        guard DPKernelSession.routeInterface(to: address) == interface else { return nil }
+        let ping = Process()
+        let output = Pipe()
+        ping.executableURL = URL(fileURLWithPath: "/sbin/ping")
+        ping.arguments = ["-n", "-c", "1", "-t", "2", "-W", "1800", "-b", interface, address]
+        var environment = ProcessInfo.processInfo.environment
+        environment["LC_ALL"] = "C"
+        ping.environment = environment
+        ping.standardOutput = output
+        ping.standardError = FileHandle.nullDevice
+        guard (try? ping.run()) != nil else { return nil }
+        let result = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        ping.waitUntilExit()
+        guard ping.terminationStatus == 0, let marker = result.range(of: "time="),
+              let value = result[marker.upperBound...].split(whereSeparator: \.isWhitespace).first,
+              let milliseconds = Double(value), milliseconds.isFinite, (0...3_000).contains(milliseconds)
+        else { return nil }
+        return Int(milliseconds.rounded())
     }
 
     private static func downloadSession() -> URLSession {

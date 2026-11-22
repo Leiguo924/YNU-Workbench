@@ -42,15 +42,7 @@ struct CampusOfficeView: View {
             }
             searchField
             HStack {
-                Picker("事项类别", selection: $category) {
-                    Text("全部").tag(nil as CampusOfficeCategory?)
-                    ForEach(CampusOfficeCategory.allCases) { category in
-                        Text(category.rawValue).tag(Optional(category))
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(maxWidth: 380)
+                categoryBar
                 Spacer()
                 Text("\(visible.count) 项")
                     .font(.system(size: 13))
@@ -59,7 +51,7 @@ struct CampusOfficeView: View {
             }
             if let selected {
                 HStack(alignment: .top, spacing: 12) {
-                    resultList(visible, selected: selected.id)
+                    resultList(visible, selected: selected.id).id(category)
                     let related = selected.relatedIDs.compactMap { id in
                         CampusOfficeDirectory.services.first { $0.id == id }
                     }
@@ -91,9 +83,46 @@ struct CampusOfficeView: View {
             }
         }
         .padding(22)
-        .frame(width: 860, height: 620)
+        .frame(width: 720, height: 560)
         .background(WorkbenchPalette.canvas)
         .onAppear { searchFocused = true }
+    }
+
+    private var categoryBar: some View {
+        HStack(spacing: 3) {
+            categoryButton(nil, title: "全部")
+            ForEach(CampusOfficeCategory.allCases) { item in
+                categoryButton(item, title: item.rawValue)
+            }
+        }
+        .fixedSize()
+        .padding(4)
+        .background(WorkbenchPalette.inset, in: RoundedRectangle(cornerRadius: 11))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("事项类别")
+    }
+
+    private func categoryButton(_ item: CampusOfficeCategory?, title: String) -> some View {
+        let selected = category == item
+        return Button {
+            guard !selected else { return }
+            selectedID = nil
+            category = item
+        } label: {
+            Text(title)
+                .font(.system(size: 14, weight: selected ? .semibold : .medium))
+                .foregroundStyle(selected ? theme.tint : WorkbenchPalette.ink)
+                .frame(width: 82, height: 32)
+                .background(selected ? WorkbenchPalette.surface : .clear, in: RoundedRectangle(cornerRadius: 8))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(selected ? theme.tint.opacity(0.25) : .clear)
+                        .allowsHitTesting(false)
+                }
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     private var searchField: some View {
@@ -135,7 +164,7 @@ struct CampusOfficeView: View {
                 proxy.scrollTo(id)
             }
         }
-        .frame(width: 240)
+        .frame(width: 216)
         .frame(maxHeight: .infinity)
         .modifier(WorkbenchSurface(radius: 12))
     }
@@ -300,7 +329,7 @@ private struct CampusOfficeDetail: View {
     private var relatedServices: some View {
         VStack(alignment: .leading, spacing: 8) {
             heading("相关事项")
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 205), alignment: .leading)], alignment: .leading, spacing: 8) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 175), alignment: .leading)], alignment: .leading, spacing: 8) {
                 ForEach(related) { item in
                     Button { openService(item.id) } label: {
                         Label(item.title, systemImage: "arrow.right")

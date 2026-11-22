@@ -24,6 +24,12 @@ struct DPCampusPolicy: Sendable {
     private let broad: Bool
     private let assignedAddress: UInt32
 
+    var permitsPortalHTTP: Bool {
+        guard let host = Self.portalDestinations.first, let address = try? Self.address(host),
+              portalAddresses.contains(address) else { return false }
+        return rules.contains { $0.matches(address) && (!$0.restricted || $0.tcp.contains { $0.contains(80) }) }
+    }
+
     init(data: Data, virtualAddress: String, broad: Bool = false, extraHosts: [String] = [], includePortal: Bool = false) throws {
         let response = try JSONSerialization.jsonObject(with: data)
         guard let root = response as? [String: Any], let groups = root["ResourceGroups"] else {

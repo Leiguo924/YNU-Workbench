@@ -1,4 +1,5 @@
 import AppKit
+import OSLog
 import Security
 import SwiftUI
 
@@ -153,6 +154,7 @@ private enum VPNKeychain {
 @MainActor
 private final class Workbench: ObservableObject {
     static let gateway = "https://vpn.ynu.edu.cn"
+    private let vpnLog = Logger(subsystem: "local.ynu.workbench", category: "VPN")
     let schedule = Schedule()
     @Published var page: Page = .courses
     @Published var showAddRoute = false
@@ -161,6 +163,9 @@ private final class Workbench: ObservableObject {
     var toggleDesktopAgenda: (() -> Void)?
     @Published var retryKeepalive = UserDefaults.standard.object(forKey: "retryVPNKeepalive") as? Bool ?? true {
         didSet { UserDefaults.standard.set(retryKeepalive, forKey: "retryVPNKeepalive") }
+    }
+    @Published var reconnectVPN = UserDefaults.standard.object(forKey: "reconnectVPN") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(reconnectVPN, forKey: "reconnectVPN") }
     }
     @Published var testingNetwork = false
     @Published var networkReport: NetworkReport?
@@ -176,7 +181,14 @@ private final class Workbench: ObservableObject {
     @Published var password = ""
     @Published var remember = UserDefaults.standard.bool(forKey: "rememberVPN")
     @Published var broad = UserDefaults.standard.object(forKey: "broadVPN") as? Bool ?? true
-    @Published var state = "未连接"
+    @Published var state = "未连接" {
+        didSet {
+            if state != oldValue { vpnLog.info("VPN 状态：\(self.state, privacy: .public)") }
+        }
+    }
+    @Published private(set) var vpnHealth: DPTunnelHealth?
+    private var didReachCampus = false
+    private var didOpenTunnel = false
     @Published var routes: [String] = []
     @Published var devices: [YNUBrowserBridge.Device] = {
         guard let data = UserDefaults.standard.data(forKey: "lastOnlineDevices") else { return [] }
@@ -209,25 +221,33 @@ private final class Workbench: ObservableObject {
     var changed: (() -> Void)?
     var quitting = false
 
-    func connect(replaceExisting: Bool = false) {
-        guard worker == nil else { return }
+    var canQuickConnect: Bool {
+        let username = account.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !busy && error == nil && remember && !username.isEmpty
+            && UserDefaults.standard.string(forKey: "vpnAccount") == username
+            && FileManager.default.fileExists(atPath: DPKernelSession.helperSocket)
+    }
+
+    @discardableResult
+    func connect(replaceExisting: Bool = false, savedPasswordOnly: Bool = false) -> Bool {
+        guard worker == nil, !savedPasswordOnly || canQuickConnect else { return false }
         let confirmedDuplicate = takeoverAvailable
         takeoverAvailable = false
         canCheckOldSession = false
-        NSApp.keyWindow?.makeFirstResponder(nil)
+        if !savedPasswordOnly { NSApp.keyWindow?.makeFirstResponder(nil) }
         let endpoint = server.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard [Self.gateway, Self.gateway + "/", "vpn.ynu.edu.cn", Self.gateway + ":443"].contains(endpoint) else {
             error = "请输入云大 VPN 地址 vpn.ynu.edu.cn。"
-            return
+            return false
         }
         guard FileManager.default.fileExists(atPath: DPKernelSession.helperSocket) else {
             error = DPKernelError.noHelper.localizedDescription
-            return
+            return false
         }
         let username = account.trimmingCharacters(in: .whitespacesAndNewlines)
-        let usedSavedPassword = password.isEmpty && remember
+        let usedSavedPassword = savedPasswordOnly || (password.isEmpty && remember)
         let secret = usedSavedPassword ? VPNKeychain.read(account: username) ?? "" : password
-        guard !username.isEmpty, !secret.isEmpty else { error = "请输入账号和密码。"; return }
+        guard !username.isEmpty, !secret.isEmpty else { error = "请输入账号和密码。"; return false }
         let shouldRemember = remember
         let useBroadRoutes = broad
         let selectedHosts = extraHosts
@@ -240,56 +260,105 @@ private final class Workbench: ObservableObject {
         } ?? false
         error = nil
         busy = true
+        vpnHealth = nil
+        didReachCampus = false
+        didOpenTunnel = false
         let connectingState = replaceExisting ? "正在接管并连接" : "正在连接"
         state = connectingState
         changed?()
-        worker = Task.detached { [weak self] in
-            var failure: String?
-            var duplicateSession = false
-            var canCheck = false
-            do {
-                try await DPKernelSession.run(username: username, password: secret, broad: useBroadRoutes, extraHosts: selectedHosts, replaceExisting: replaceExisting, confirmedDuplicate: confirmedDuplicate, includePortal: routePortal, retryKeepalive: shouldRetry) { [weak self] _, hosts in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.worker?.isCancelled == false, self.state == connectingState else { return }
-                        let defaults = UserDefaults.standard
-                        defaults.set(username, forKey: "vpnAccount")
-                        defaults.set(shouldRemember, forKey: "rememberVPN")
-                        defaults.set(useBroadRoutes, forKey: "broadVPN")
-                        if let previousAccount, previousAccount != username {
-                            _ = VPNKeychain.remove(account: previousAccount)
+        worker = Task { [weak self] in
+            var failures = 0
+            while !Task.isCancelled {
+                let takeOver = failures == 0 && replaceExisting
+                let started = ContinuousClock.now
+                do {
+                    try await DPKernelSession.run(username: username, password: secret, broad: useBroadRoutes,
+                                                  extraHosts: selectedHosts, replaceExisting: takeOver,
+                                                  confirmedDuplicate: takeOver && confirmedDuplicate, includePortal: routePortal,
+                                                  retryKeepalive: shouldRetry, health: { [weak self] health in
+                        self?.updateVPNHealth(health)
+                    }) { [weak self] _, hosts in
+                        guard let self, self.worker?.isCancelled == false else { return }
+                        if !self.didOpenTunnel {
+                            let defaults = UserDefaults.standard
+                            defaults.set(username, forKey: "vpnAccount")
+                            defaults.set(shouldRemember, forKey: "rememberVPN")
+                            defaults.set(useBroadRoutes, forKey: "broadVPN")
+                            if let previousAccount, previousAccount != username {
+                                _ = VPNKeychain.remove(account: previousAccount)
+                            }
+                            let result = shouldRemember ? VPNKeychain.save(secret, account: username) : VPNKeychain.remove(account: username)
+                            if result != errSecSuccess { self.error = "无法更新钥匙串中的 VPN 密码（\(result)）。" }
+                            self.password = ""
+                            self.didOpenTunnel = true
                         }
-                        let result = shouldRemember ? VPNKeychain.save(secret, account: username) : VPNKeychain.remove(account: username)
-                        if result != errSecSuccess { self.error = "无法更新钥匙串中的 VPN 密码（\(result)）。" }
-                        self.password = ""
                         self.routes = hosts
-                        self.state = "已连接"
-                        self.changed?()
-                        self.startCampusSync()
+                        self.updateVPNHealth(.checking)
                     }
-                }
-            } catch DPControlError.invalidSession(let rejection) {
-                if !Task.isCancelled {
-                    duplicateSession = rejection.reason == .duplicate
-                    canCheck = duplicateSession || rejection.reason == .authentication || rejection.reason == .unknown
-                    failure = rejection.message
+                    break
+                } catch DPControlError.invalidSession(let rejection) {
+                    guard !Task.isCancelled else { break }
+                    let duplicateSession = rejection.reason == .duplicate
+                    let canCheck = duplicateSession || rejection.reason == .authentication || rejection.reason == .unknown
+                    var failure = rejection.message
                     if usedSavedPassword && rejection.reason != .duplicate && rejection.reason != .locked {
                         failure = rejection.message + " 可以重新输入密码，覆盖钥匙串中的旧值。"
                     }
-                    if replaceExisting && (confirmedDuplicate || duplicateSession), let detail = failure {
-                        failure = "网关未完成旧会话接管。\(detail)"
+                    if takeOver && (confirmedDuplicate || duplicateSession) {
+                        failure = "网关未完成旧会话接管。\(failure)"
                     }
-                }
-            } catch let issue as DPKernelError {
-                if !Task.isCancelled {
-                    failure = issue.localizedDescription
-                    if case .routeMismatch = issue, anotherWorkbenchIsRunning {
-                        failure = issue.localizedDescription + " 检测到另一个工作台实例正在运行。请断开旧版工作台的 VPN 后重试。"
+                    self?.finished(failure, duplicateSession: duplicateSession, canCheck: canCheck)
+                    return
+                } catch {
+                    guard !Task.isCancelled else { break }
+                    var failure = error.localizedDescription
+                    if let issue = error as? DPKernelError, case .routeMismatch = issue, anotherWorkbenchIsRunning {
+                        failure += " 检测到另一个工作台实例正在运行。请断开旧版工作台的 VPN 后重试。"
                     }
+                    guard self?.didOpenTunnel == true, self?.reconnectVPN == true,
+                          DPReconnectPolicy.canRetry(error) else {
+                        self?.finished(failure)
+                        return
+                    }
+                    if self?.didReachCampus == true, ContinuousClock.now - started >= .seconds(90) {
+                        failures = 1
+                    } else {
+                        failures += 1
+                    }
+                    let delay = DPReconnectPolicy.delay(afterFailures: failures - 1)
+                    self?.routes = []
+                    self?.didReachCampus = false
+                    self?.updateVPNHealth(.reconnecting(delay, failure))
+                    do {
+                        try await Task.sleep(for: .seconds(delay))
+                        try await DPNetworkAvailability.waitUntilAvailable()
+                    } catch { break }
+                    guard !Task.isCancelled else { break }
+                    guard self?.reconnectVPN == true else {
+                        self?.finished(failure)
+                        return
+                    }
+                    self?.updateVPNHealth(.connectingAgain)
                 }
-            } catch {
-                if !Task.isCancelled { failure = error.localizedDescription }
             }
-            await self?.finished(failure, duplicateSession: duplicateSession, canCheck: canCheck)
+            self?.finished(nil)
+        }
+        return true
+    }
+
+    private func updateVPNHealth(_ health: DPTunnelHealth) {
+        guard worker?.isCancelled == false, health != vpnHealth else { return }
+        vpnHealth = health
+        state = health.status
+        if health == .stopping {
+            campusSync?.cancel()
+            campusSync = nil
+            campusSyncGeneration = nil
+        }
+        changed?()
+        if health.isVerified, !didReachCampus {
+            didReachCampus = true
+            startCampusSync()
         }
     }
 
@@ -431,6 +500,7 @@ private final class Workbench: ObservableObject {
         campusSync = nil
         campusSyncGeneration = nil
         guard let worker, !worker.isCancelled else { return }
+        vpnHealth = nil
         state = "正在断开"
         changed?()
         worker.cancel()
@@ -441,6 +511,7 @@ private final class Workbench: ObservableObject {
         canCheckOldSession = canCheck
         worker = nil
         busy = false
+        vpnHealth = nil
         state = failure == nil ? "未连接" : "连接失败"
         routes = []
         if let failure { error = failure }
@@ -607,8 +678,9 @@ private struct WorkbenchView: View {
                         Text(settingsSection).font(.system(size: 22, weight: .semibold))
                         switch settingsSection {
                         case "网络":
-                            settingsSwitch("连接异常时自动重试", isOn: $app.retryKeepalive)
-                            Text("短时网络异常时，保持 VPN 并重试。")
+                            settingsSwitch("VPN 掉线后自动重连", isOn: $app.reconnectVPN)
+                            settingsSwitch("保活检查异常时重试", isOn: $app.retryKeepalive)
+                            Text("手动断开会取消自动重连。")
                                 .font(.subheadline).foregroundStyle(.secondary)
                             Divider()
                             settingsSwitch("校园网段走 VPN", isOn: $app.broad)
@@ -855,7 +927,8 @@ private struct WorkbenchView: View {
             HStack {
                 Label("校园 VPN", systemImage: "lock.shield").font(.system(size: 17, weight: .semibold))
                 Spacer()
-                Text(app.state).foregroundStyle(.secondary)
+                Text(app.vpnHealth?.shortStatus ?? app.state)
+                    .foregroundStyle(.secondary)
                 Image(systemName: app.showVPNControls ? "chevron.up" : "chevron.down").foregroundStyle(theme.tint)
             }.padding(.vertical, 5).frame(maxWidth: .infinity).contentShape(Rectangle())
         }.buttonStyle(.plain).accessibilityValue(app.showVPNControls ? "已展开" : "已折叠")
@@ -907,13 +980,16 @@ private struct WorkbenchView: View {
 
     private var vpnStatus: some View {
         HStack(alignment: .center, spacing: 15) {
-            Image(systemName: app.routes.isEmpty ? "lock.shield" : "checkmark.shield.fill")
+            Image(systemName: app.vpnHealth?.isVerified == true ? "checkmark.shield.fill" : "lock.shield")
                 .font(.system(size: 28, weight: .medium)).foregroundStyle(theme.tint)
                 .frame(width: 54, height: 54)
                 .background(theme.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 15))
             VStack(alignment: .leading, spacing: 4) {
                 Text("校园 VPN").font(.system(size: 22, weight: .semibold))
                 Text(app.state).font(.system(size: 15, weight: .semibold)).foregroundStyle(.secondary)
+                if let detail = app.vpnHealth?.detail {
+                    Text(detail).font(.system(size: 13)).foregroundStyle(.secondary)
+                }
             }
             Spacer()
             if app.busy {
@@ -1133,7 +1209,7 @@ private struct VPNPasswordField: NSViewRepresentable {
 }
 
 @MainActor
-final class DPMenuApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class DPMenuApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     private let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let model = Workbench()
     private var window: NSWindow?
@@ -1150,33 +1226,17 @@ final class DPMenuApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         importTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.model.refreshSelectedPages() }
         }
-        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
-            let path = NSBezierPath()
-            path.lineWidth = 1.35
-            path.lineJoinStyle = .round
-            path.move(to: NSPoint(x: 9, y: 4))
-            for point in [NSPoint(x: 6, y: 5), NSPoint(x: 2, y: 5), NSPoint(x: 2, y: 14),
-                          NSPoint(x: 6, y: 14), NSPoint(x: 9, y: 13), NSPoint(x: 12, y: 14),
-                          NSPoint(x: 16, y: 14), NSPoint(x: 16, y: 5), NSPoint(x: 12, y: 5),
-                          NSPoint(x: 9, y: 4), NSPoint(x: 9, y: 13)] {
-                path.line(to: point)
-            }
-            NSColor.black.setStroke()
-            path.stroke()
-            return true
-        }
-        image.isTemplate = true
-        image.accessibilityDescription = "云大工作台"
-        status.button?.image = image
+        status.button?.image = WorkbenchMark.menuImage
         status.isVisible = true
         let menu = NSMenu()
         menu.autoenablesItems = false
+        menu.delegate = self
         statusLabel = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
+        vpnAction = add("连接 VPN…", #selector(toggleVPN), to: menu)
         menu.addItem(.separator())
         add("打开云大工作台", #selector(openWorkbench), to: menu)
         agendaAction = add("显示桌面课表", #selector(toggleDesktopAgenda), to: menu)
         model.toggleDesktopAgenda = { [weak self] in self?.toggleDesktopAgenda() }
-        vpnAction = add("连接 VPN…", #selector(toggleVPN), to: menu)
         let networkMenu = NSMenu()
         networkMenu.autoenablesItems = false
         speedAction = add("测速", #selector(testNetwork), to: networkMenu)
@@ -1219,16 +1279,24 @@ final class DPMenuApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func updateMenu() {
-        statusLabel?.title = "VPN  \(model.state)"
-        status.button?.toolTip = "云大工作台 · VPN \(model.state)"
-        vpnAction?.title = model.busy ? "断开 VPN" : "连接 VPN…"
+        let vpnStatus = model.vpnHealth?.shortStatus ?? model.state
+        statusLabel?.title = vpnStatus
+        statusLabel?.isHidden = !model.busy
+        status.button?.toolTip = "云大工作台"
+        if model.busy {
+            vpnAction?.title = "断开 VPN"
+        } else {
+            vpnAction?.title = model.canQuickConnect ? "快速连接 VPN" : "连接 VPN…"
+        }
+        vpnAction?.isEnabled = model.state != "正在断开"
         agendaAction?.title = model.desktopAgendaVisible ? "隐藏桌面课表" : "显示桌面课表"
         speedAction?.title = model.testingNetwork ? "测速中…" : model.networkReport.map { "测速 · " + $0.shortResult } ?? "测速"
         speedAction?.isEnabled = !model.testingNetwork
-        if let result = model.networkReport {
-            status.button?.toolTip = "云大工作台 · VPN \(model.state) · \(result.shortResult)"
-        }
         status.button?.appearsDisabled = false
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        updateMenu()
     }
 
     @discardableResult
@@ -1303,7 +1371,7 @@ final class DPMenuApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc private func toggleVPN() {
         if model.busy {
             model.disconnect()
-        } else {
+        } else if !model.connect(savedPasswordOnly: true) {
             model.showVPNControls = true
             show(.vpn)
         }

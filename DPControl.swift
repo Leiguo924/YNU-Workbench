@@ -206,8 +206,10 @@ final class DPControl: @unchecked Sendable {
         catch { throw DPControlError.invalidPayload("隧道密钥配置") }
     }
 
-    func endSession(_ session: DPSession) async throws {
-        let (_, response) = try await send(request("sslvpn/SSLVPN_IP_EXIT", session: session))
+    func endSession(_ session: DPSession, timeout: TimeInterval? = nil) async throws {
+        var exit = request("sslvpn/SSLVPN_IP_EXIT", session: session)
+        if let timeout { exit.timeoutInterval = timeout }
+        let (_, response) = try await send(exit)
         guard (200..<400).contains(response.statusCode) else {
             throw DPControlError.unexpectedStatus(response.statusCode)
         }
