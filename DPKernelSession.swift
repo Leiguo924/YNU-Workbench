@@ -3,6 +3,8 @@ import Foundation
 
 enum DPKernelError: LocalizedError {
     case noAuthorizedRoutes
+    case sessionExpired
+    case keepaliveFailed(String)
     case sessionEnded
     case routeMismatch(destination: String, expected: String, actual: String?)
     case noHelper
@@ -10,6 +12,8 @@ enum DPKernelError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .noAuthorizedRoutes: return "学校网关没有授权本客户端配置的校内目标。"
+        case .sessionExpired: return "学校网关已结束当前 VPN 会话，请重新连接。"
+        case .keepaliveFailed(let message): return "多次检查不到 VPN 连接，已断开。\(message)"
         case .sessionEnded: return "虚拟网卡或 UDP 套接字已关闭。"
         case .routeMismatch(let destination, let expected, let actual):
             return "网关已接受登录，但 \(destination) 的系统路由是 \(actual ?? "无路由")，预期使用 \(expected)。"
@@ -40,7 +44,7 @@ enum DPKernelSession {
     static let helperSocket = "/var/run/ynu-native-vpn.sock"
 
     static func run(
-        username: String, password: String, broad: Bool = false, extraHosts: [String] = [], replaceExisting: Bool = false, confirmedDuplicate: Bool = false, includePortal: Bool = false,
+        username: String, password: String, broad: Bool = false, extraHosts: [String] = [], replaceExisting: Bool = false, confirmedDuplicate: Bool = false, includePortal: Bool = false, retryKeepalive: Bool = true,
         ready: @escaping @Sendable (String, [String]) -> Void
     ) async throws {
         guard FileManager.default.fileExists(atPath: helperSocket) else { throw DPKernelError.noHelper }
@@ -79,15 +83,37 @@ enum DPKernelSession {
                         try pump(tunnel, transport: transport, associations: associations, policy: policy, stop: stop)
                     }
                     group.addTask {
-                        var consecutiveFailures = 0
+                        let clock = ContinuousClock()
+                        var failuresSince: ContinuousClock.Instant?
+                        var rejectedChecks = 0
+                        var retryDelay = Duration.seconds(15)
                         while !Task.isCancelled {
-                            try await Task.sleep(nanoseconds: 15_000_000_000)
+                            try await Task.sleep(for: retryDelay)
                             do {
                                 try await gateway.keepalive(session)
-                                consecutiveFailures = 0
-                            } catch let error as URLError where [.timedOut, .networkConnectionLost, .cannotConnectToHost].contains(error.code) {
-                                consecutiveFailures += 1
-                                if consecutiveFailures >= 3 { throw error }
+                                failuresSince = nil
+                                rejectedChecks = 0
+                                retryDelay = .seconds(15)
+                            } catch {
+                                try Task.checkCancellation()
+                                if !retryKeepalive { throw error }
+                                if case DPControlError.unexpectedStatus(let status) = error,
+                                   status == 401 || status == 403 {
+                                    rejectedChecks += 1
+                                    if rejectedChecks >= 2 { throw DPKernelError.sessionExpired }
+                                } else {
+                                    rejectedChecks = 0
+                                }
+                                let now = clock.now
+                                if let first = failuresSince {
+                                    if now - first >= .seconds(75) {
+                                        throw DPKernelError.keepaliveFailed(error.localizedDescription)
+                                    }
+                                    retryDelay = min(.seconds(15), retryDelay * 2)
+                                } else {
+                                    failuresSince = now
+                                    retryDelay = .seconds(4)
+                                }
                             }
                         }
                     }
@@ -131,7 +157,7 @@ enum DPKernelSession {
         }
     }
 
-    private static func routeInterface(to host: String) -> String? {
+    static func routeInterface(to host: String) -> String? {
         let pipe = Pipe()
         let command = Process()
         command.executableURL = URL(fileURLWithPath: "/sbin/route")

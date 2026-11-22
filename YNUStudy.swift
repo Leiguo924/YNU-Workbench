@@ -100,9 +100,11 @@ final class Schedule: ObservableObject {
     @Published var confirmDeleteCourse = false
     @Published var showTodo = false
     var selectedTodo: TodoItem?
+    var newTodoTitle = ""
 
-    func openTodo(_ task: TodoItem? = nil) {
+    func openTodo(_ task: TodoItem? = nil, startingWith title: String = "") {
         selectedTodo = task
+        newTodoTitle = title
         showTodo = true
     }
     @Published var showGroup = false
@@ -260,6 +262,27 @@ func validatedCampusURL(_ text:String)->URL? {
 
 struct TodoView: View {
     @ObservedObject var model: Schedule
+    @AppStorage("workbenchTheme") private var themeName = WorkbenchTheme.ocean.rawValue
+    private var theme: WorkbenchTheme { WorkbenchTheme(rawValue: themeName) ?? .ocean }
+    @State private var exporting = false
+    @State private var exportMessage: String?
+    @State private var filter: TaskFilter = .all
+
+    private enum TaskFilter: String, CaseIterable {
+        case all = "全部", today = "今天", upcoming = "未来一周"
+    }
+
+    private var filtered: [TodoItem] {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: .now)
+        let end = calendar.date(byAdding: .day, value: 7, to: today) ?? today
+        return ordered.filter { task in
+            if filter == .all { return true }
+            guard !task.done, let due = task.due else { return false }
+            if filter == .today { return calendar.isDate(due, inSameDayAs: today) }
+            return due >= today && due < end
+        }
+    }
     private var ordered: [TodoItem] {
         model.todos.sorted { first, second in
             first.done == second.done ? (first.due ?? .distantFuture) < (second.due ?? .distantFuture) : !first.done
@@ -272,28 +295,51 @@ struct TodoView: View {
                 Text("未完成 · \(ordered.filter { !$0.done }.count)")
                     .font(.headline).foregroundStyle(.secondary)
                 Spacer()
+                Button {
+                    exporting = true
+                    let snapshot = model.todos
+                    Task {
+                        defer { exporting = false }
+                        do {
+                            let count = try await ReminderExport.export(snapshot)
+                            exportMessage = count == 0 ? "没有新的待办需要导出。" : "已导出 \(count) 项到提醒事项。"
+                        } catch { exportMessage = error.localizedDescription }
+                    }
+                } label: {
+                    Label(exporting ? "导出中…" : "导出到提醒事项", systemImage: "square.and.arrow.up")
+                }.buttonStyle(WorkbenchButton(kind: .secondary, tint: theme.tint))
+                    .disabled(exporting || !model.todos.contains { !$0.done })
                 Button { model.openTodo() } label: {
                     Label("添加待办", systemImage: "plus").font(.system(size: 14, weight: .semibold))
-                }.buttonStyle(.borderedProminent)
+                }.buttonStyle(WorkbenchButton(kind: .primary, tint: theme.tint))
             }
-            if ordered.isEmpty {
+            Picker("待办范围", selection: $filter) {
+                ForEach(TaskFilter.allCases, id: \.self) { item in Text(item.rawValue).tag(item) }
+            }.pickerStyle(.segmented).labelsHidden().frame(maxWidth: 285)
+            if let exportMessage { Text(exportMessage).font(.subheadline).foregroundStyle(.secondary) }
+            if filtered.isEmpty {
                 VStack(spacing: 9) {
-                    Image(systemName: "checklist").font(.system(size: 28)).foregroundStyle(Color.teal)
+                    Image(systemName: "checklist").font(.system(size: 25)).foregroundStyle(WorkbenchPalette.muted)
                     Text("暂无待办").font(.headline)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
                     .foregroundStyle(.secondary)
             } else {
                 ScrollView {
-                    LazyVStack(spacing: 10) {
-                        ForEach(ordered) { task in row(task) }
-                    }.padding(.vertical, 2)
+                    LazyVStack(spacing: 0) {
+                        ForEach(filtered) { task in
+                            row(task)
+                            if task.id != filtered.last?.id {
+                                Rectangle().fill(WorkbenchPalette.line).frame(height: 1).padding(.leading, 49)
+                            }
+                        }
+                    }.modifier(WorkbenchSurface())
                 }
             }
         }
     }
 
     private func row(_ task: TodoItem) -> some View {
-        let accent: Color = task.done ? .teal : task.overdue ? .red : .accentColor
+        let accent: Color = task.overdue ? .red : task.done ? WorkbenchPalette.muted : theme.tint
         return HStack(alignment: .center, spacing: 14) {
             Button {
                 guard let index = model.todos.firstIndex(where: { $0.id == task.id }) else { return }
@@ -301,19 +347,20 @@ struct TodoView: View {
                 persist()
             } label: {
                 Image(systemName: task.done ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 23)).foregroundStyle(accent)
-                    .frame(width: 32, height: 36)
+                    .font(.system(size: 20)).foregroundStyle(accent)
+                    .frame(width: 27, height: 32)
             }.buttonStyle(.plain).accessibilityLabel(task.done ? "标为待办" : "标为完成")
             VStack(alignment: .leading, spacing: 5) {
-                Text(task.title).font(.system(size: 18, weight: .medium))
-                    .strikethrough(task.done).foregroundStyle(task.done ? .secondary : .primary)
+                Text(task.title).font(.system(size: 16, weight: .medium))
+                    .strikethrough(task.done).foregroundStyle(task.done ? WorkbenchPalette.muted : WorkbenchPalette.ink)
                     .fixedSize(horizontal: false, vertical: true)
                 if let date = task.due {
                     let formatted = task.hasTime == true
                         ? date.formatted(.dateTime.month().day().hour().minute())
                         : date.formatted(.dateTime.month().day())
                     Label(formatted, systemImage: "calendar")
-                        .font(.system(size: 14, weight: .medium)).foregroundStyle(accent)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(task.overdue ? accent : WorkbenchPalette.muted)
                 }
             }.frame(maxWidth: .infinity, alignment: .leading)
             Menu {
@@ -323,15 +370,11 @@ struct TodoView: View {
                     persist()
                 }
             } label: {
-                Image(systemName: "ellipsis.circle").font(.system(size: 19))
+                Image(systemName: "ellipsis").font(.system(size: 16, weight: .medium)).foregroundStyle(WorkbenchPalette.muted)
             }.menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                 .accessibilityLabel("待办操作")
         }
         .padding(.horizontal, 14).padding(.vertical, 12)
-        .background(accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 14))
-        .overlay {
-            RoundedRectangle(cornerRadius: 14).strokeBorder(accent.opacity(0.18))
-        }
     }
 
     private func persist() { model.persist(model.todos, key: "todos") }
@@ -411,7 +454,9 @@ struct TodoEditor: View {
             }.controlSize(.large)
         }
         .padding(24).frame(width: 485).tint(tint)
+        .background(WorkbenchPalette.canvas)
         .onAppear {
+            title = model.newTodoTitle
             if let task = model.selectedTodo {
                 title = task.title
                 if let due = task.due {
@@ -443,7 +488,7 @@ struct TodoEditor: View {
                 }.buttonStyle(.plain).accessibilityLabel(pickerLabel).help(pickerLabel)
             }
             .frame(height: 35)
-            .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 9))
+            .background(WorkbenchPalette.surface, in: RoundedRectangle(cornerRadius: 8))
             .clipShape(RoundedRectangle(cornerRadius: 9))
             .overlay { RoundedRectangle(cornerRadius: 9).strokeBorder(tint.opacity(0.19)).allowsHitTesting(false) }
         }.frame(maxWidth: .infinity, alignment: .leading)
@@ -836,29 +881,37 @@ struct CourseDetail: View {
                         Image(systemName: "xmark.circle.fill").font(.system(size: 20))
                             .accessibilityLabel("关闭").frame(width: 28, height: 28)
                     }.buttonStyle(.plain).keyboardShortcut(.cancelAction)
-                }.foregroundStyle(.white.opacity(0.85))
-                Text(meeting.course.name).font(.system(size: 29, weight: .semibold))
-                    .foregroundStyle(.white).fixedSize(horizontal: false, vertical: true)
+                }.foregroundStyle(WorkbenchPalette.muted)
+                Text(meeting.course.name).font(.system(size: 25, weight: .semibold))
+                    .foregroundStyle(WorkbenchPalette.ink).fixedSize(horizontal: false, vertical: true)
                 if meeting.adjusted {
                     Label("已调课", systemImage: "arrow.trianglehead.2.clockwise.rotate.90")
-                        .font(.caption).foregroundStyle(.white)
+                        .font(.caption).foregroundStyle(theme.tint)
                 }
             }.frame(maxWidth: .infinity, alignment: .leading).padding(17)
-                .background(LinearGradient(colors: theme.banner, startPoint: .topLeading, endPoint: .bottomTrailing),
-                            in: RoundedRectangle(cornerRadius: 16))
+                .modifier(WorkbenchSurface())
             Grid(alignment: .leading, horizontalSpacing: 22, verticalSpacing: 15) {
                 detail("日期", icon: "calendar", value: meeting.day.formatted(.dateTime.month().day().weekday(.wide)))
                 detail("时间", icon: "clock", value: time)
                 detail("地点", icon: "mappin.and.ellipse", value: meeting.place.isEmpty ? "未填写" : meeting.place)
                 detail("周次", icon: "rectangle.stack", value: meeting.course.weeks + "周")
             }.frame(maxWidth: .infinity, alignment: .leading).padding(17)
-                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                .modifier(WorkbenchSurface())
             if let note = model.notes[meeting.course.name], !note.isEmpty {
                 Text(note).font(.system(size: 16)).frame(maxWidth: .infinity, alignment: .leading).padding(11)
                     .background(theme.tint.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
             }
             HStack {
                 Menu("更多") {
+                    Button("为这门课添加待办") {
+                        openNext { model.openTodo(startingWith: meeting.course.name + "：") }
+                    }
+                    Button("复制上课信息") {
+                        let date = meeting.day.formatted(.dateTime.month().day().weekday(.wide))
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString([meeting.course.name, date, time, meeting.place]
+                            .filter { !$0.isEmpty }.joined(separator: "\n"), forType: .string)
+                    }
                     Button("课程备注") { openNext { model.noteTarget = meeting.course } }
                     if manual {
                         Button("编辑课程") { openNext { model.editingManual = meeting.course } }
@@ -872,7 +925,7 @@ struct CourseDetail: View {
                     .buttonStyle(.borderedProminent)
             }
         }.padding(24).frame(width: 555)
-            .background(.regularMaterial).tint(theme.tint)
+            .background(WorkbenchPalette.canvas).tint(theme.tint)
             .alert("删除整门手动课程？", isPresented: $model.confirmDeleteCourse) {
                 Button("删除", role: .destructive) {
                     model.manualCourses.removeAll { $0.id == meeting.course.id }

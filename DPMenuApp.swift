@@ -40,22 +40,85 @@ enum WorkbenchTheme: String, CaseIterable {
 
     var tint: Color {
         switch self {
-        case .ocean: return Color(red: 0.20, green: 0.49, blue: 0.82)
-        case .jade: return .teal
-        case .indigo: return .indigo
-        case .rust: return Color(red: 0.74, green: 0.36, blue: 0.26)
+        case .ocean: return WorkbenchPalette.adaptive(light: 0x2e5fb3, dark: 0x8bb4ff)
+        case .jade: return WorkbenchPalette.adaptive(light: 0x177a73, dark: 0x6cc8b9)
+        case .indigo: return WorkbenchPalette.adaptive(light: 0x5b4db3, dark: 0xb5a2ff)
+        case .rust: return WorkbenchPalette.adaptive(light: 0xa04d3b, dark: 0xe5a38e)
         }
     }
 
-    var banner: [Color] {
+    var bannerColors: [Color] {
+        let shades: (UInt32, UInt32)
         switch self {
-        case .ocean: return [Color(red: 0.12, green: 0.25, blue: 0.50), Color(red: 0.12, green: 0.43, blue: 0.62)]
-        case .jade: return [Color(red: 0.09, green: 0.30, blue: 0.34), Color(red: 0.12, green: 0.44, blue: 0.42)]
-        case .indigo: return [Color(red: 0.23, green: 0.22, blue: 0.47), Color(red: 0.40, green: 0.32, blue: 0.60)]
-        case .rust: return [Color(red: 0.48, green: 0.24, blue: 0.23), Color(red: 0.65, green: 0.35, blue: 0.25)]
+        case .ocean: shades = (0x244782, 0x2c5ca3)
+        case .jade: shades = (0x145852, 0x206f64)
+        case .indigo: shades = (0x443781, 0x5b499b)
+        case .rust: shades = (0x733f34, 0x9a4e3d)
         }
+        return [shades.0, shades.1].map { WorkbenchPalette.adaptive(light: $0, dark: $0) }
     }
 }
+
+enum WorkbenchPalette {
+    static let canvas = adaptive(light: 0xf5f6f9, dark: 0x181a20)
+    static let surface = adaptive(light: 0xffffff, dark: 0x20232b)
+    static let inset = adaptive(light: 0xeff1f5, dark: 0x292d37)
+    static let ink = adaptive(light: 0x252a38, dark: 0xe9ebf2)
+    static let muted = adaptive(light: 0x596375, dark: 0xaeb6c6)
+    static let line = adaptive(light: 0xdce1e9, dark: 0x3a4050)
+
+    static func adaptive(light: UInt32, dark: UInt32) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            let value = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+            return NSColor(srgbRed: Double((value >> 16) & 255) / 255,
+                           green: Double((value >> 8) & 255) / 255,
+                           blue: Double(value & 255) / 255, alpha: 1)
+        })
+    }
+}
+
+struct WorkbenchSurface: ViewModifier {
+    var radius: CGFloat = 13
+
+    func body(content: Content) -> some View {
+        content.background(WorkbenchPalette.surface, in: RoundedRectangle(cornerRadius: radius))
+            .overlay {
+                RoundedRectangle(cornerRadius: radius).strokeBorder(WorkbenchPalette.line)
+                    .allowsHitTesting(false)
+            }
+    }
+}
+
+struct WorkbenchButton: ButtonStyle {
+    enum Kind { case primary, secondary, icon }
+
+    let kind: Kind
+    let tint: Color
+    @Environment(\.isEnabled) private var enabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 8)
+        let foreground = kind == .primary ? tint : WorkbenchPalette.ink
+        let fill = kind == .primary ? tint.opacity(configuration.isPressed ? 0.20 : 0.11)
+            : kind == .secondary ? WorkbenchPalette.surface : Color.clear
+        configuration.label
+            .font(.system(size: 13, weight: kind == .primary ? .semibold : .medium))
+            .lineLimit(1)
+            .foregroundStyle(foreground)
+            .padding(.horizontal, kind == .icon ? 8 : 11)
+            .frame(minWidth: 34, minHeight: 32)
+            .background(fill, in: shape)
+            .overlay {
+                if kind == .secondary {
+                    shape.strokeBorder(WorkbenchPalette.line)
+                        .allowsHitTesting(false)
+                }
+            }
+            .contentShape(shape)
+            .opacity(enabled ? (configuration.isPressed ? 0.78 : 1) : 0.44)
+    }
+}
+
 private enum VPNKeychain {
     static let service = "local.ynu.workbench.vpn"
 
@@ -92,6 +155,15 @@ private final class Workbench: ObservableObject {
     static let gateway = "https://vpn.ynu.edu.cn"
     let schedule = Schedule()
     @Published var page: Page = .courses
+    @Published var showAddRoute = false
+    @Published var showVPNControls = false
+    @Published var desktopAgendaVisible = false
+    var toggleDesktopAgenda: (() -> Void)?
+    @Published var retryKeepalive = UserDefaults.standard.object(forKey: "retryVPNKeepalive") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(retryKeepalive, forKey: "retryVPNKeepalive") }
+    }
+    @Published var testingNetwork = false
+    @Published var networkReport: NetworkReport?
     @Published var server = gateway
     @Published var appearance = WorkbenchAppearance(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "") ?? .system {
         didSet {
@@ -160,6 +232,7 @@ private final class Workbench: ObservableObject {
         let useBroadRoutes = broad
         let selectedHosts = extraHosts
         let routePortal = includePortal
+        let shouldRetry = retryKeepalive
         let previousAccount = UserDefaults.standard.string(forKey: "vpnAccount")
         let anotherWorkbenchIsRunning = Bundle.main.bundleIdentifier.map { identifier in
             NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
@@ -175,7 +248,7 @@ private final class Workbench: ObservableObject {
             var duplicateSession = false
             var canCheck = false
             do {
-                try await DPKernelSession.run(username: username, password: secret, broad: useBroadRoutes, extraHosts: selectedHosts, replaceExisting: replaceExisting, confirmedDuplicate: confirmedDuplicate, includePortal: routePortal) { [weak self] _, hosts in
+                try await DPKernelSession.run(username: username, password: secret, broad: useBroadRoutes, extraHosts: selectedHosts, replaceExisting: replaceExisting, confirmedDuplicate: confirmedDuplicate, includePortal: routePortal, retryKeepalive: shouldRetry) { [weak self] _, hosts in
                     Task { @MainActor [weak self] in
                         guard let self, self.worker?.isCancelled == false, self.state == connectingState else { return }
                         let defaults = UserDefaults.standard
@@ -220,6 +293,17 @@ private final class Workbench: ObservableObject {
         }
     }
 
+    func testNetwork() {
+        guard !testingNetwork else { return }
+        testingNetwork = true
+        changed?()
+        Task {
+            networkReport = await NetworkReport.measure()
+            testingNetwork = false
+            changed?()
+        }
+    }
+
     func startCampusSync(onLaunch: Bool = false) {
         guard syncOnConnect else { return }
         let previous = campusSync
@@ -236,7 +320,7 @@ private final class Workbench: ObservableObject {
             }
             self.schedule.status = onLaunch ? "正在同步课表。" : "VPN 已连接，正在同步课表。"
             self.deviceMessage = "正在同步在线设备…"
-            await self.syncCampusPages(includeCourses: true, canOpen: true)
+            await self.syncCampusPages(includeCourses: true)
         }
     }
 
@@ -245,16 +329,16 @@ private final class Workbench: ObservableObject {
         let retryDevices = syncOnConnect && pendingDevices
         guard automaticImport || retryCourses || retryDevices,
               !refreshing, !importing, campusSync == nil else { return }
-        Task { await syncCampusPages(includeCourses: retryCourses, canOpen: false) }
+        Task { await syncCampusPages(includeCourses: retryCourses) }
     }
 
-    private func syncCampusPages(includeCourses: Bool, canOpen: Bool) async {
+    private func syncCampusPages(includeCourses: Bool) async {
         guard !refreshing else { return }
         refreshing = true
         defer { refreshing = false }
         if includeCourses {
             do {
-                let text = try await readConnectedPage(.courses, canOpen: canOpen)
+                let text = try await YNUBrowserBridge.read(.courses, browser: browser)
                 guard !Task.isCancelled else { return }
                 if schedule.importBrowserText(text) { pendingCourses = false }
                 else { schedule.status = YNUBrowserBridge.ReadError.unsupportedFormat.localizedDescription }
@@ -264,7 +348,7 @@ private final class Workbench: ObservableObject {
             }
         }
         guard !Task.isCancelled else { return }
-        do { try await updateDeviceList(canOpen: canOpen) }
+        do { try await updateDeviceList() }
         catch let error as YNUBrowserBridge.ReadError
             where error == .automationUnavailable || error == .javaScriptUnavailable {
             deviceMessage = error.localizedDescription
@@ -273,30 +357,12 @@ private final class Workbench: ObservableObject {
         }
     }
 
-    private func readConnectedPage(_ kind: YNUBrowserBridge.Kind, canOpen: Bool) async throws -> String {
-        do {
-            return try await YNUBrowserBridge.read(kind, browser: browser)
-        } catch let error as YNUBrowserBridge.ReadError {
-            guard canOpen, error == .noSchoolPage || error == .browserClosed else { throw error }
-        }
-        let address = kind == .courses ? YNUBrowserBridge.selectedCourseImportURL : YNUBrowserBridge.portalIP
-        try Task.checkCancellation()
-        YNUBrowserBridge.openLinkedPage(address, browser: browser, activates: false)
-        for attempt in 0..<4 {
-            try await Task.sleep(for: .seconds(2))
-            do { return try await YNUBrowserBridge.read(kind, browser: browser) }
-            catch let error as YNUBrowserBridge.ReadError where attempt < 3 &&
-                (error == .noSchoolPage || error == .browserClosed || error == .unsupportedFormat) {}
-        }
-        throw YNUBrowserBridge.ReadError.unsupportedFormat
-    }
-
-    private func updateDeviceList(canOpen: Bool = false) async throws {
+    private func updateDeviceList() async throws {
         let text: String
         if let direct = try? await YNUBrowserBridge.readDevicesOverHTTP() {
             text = direct
         } else {
-            text = try await readConnectedPage(.devices, canOpen: canOpen)
+            text = try await YNUBrowserBridge.read(.devices, browser: browser)
         }
         guard !Task.isCancelled else { return }
         let imported = YNUBrowserBridge.devices(in: text)
@@ -388,7 +454,9 @@ private struct WorkbenchView: View {
     @ObservedObject var schedule: Schedule
     @Environment(\.colorScheme) private var colorScheme
     @State private var settings = false
-    @State private var addRoute = false
+    @State private var showCampusNotices = false
+    @State private var showCampusOffice = false
+    @State private var showNetworkDetails = false
     @State private var routeInput = ""
     @State private var resolvingRoute = false
     @State private var routeMessage = ""
@@ -399,6 +467,7 @@ private struct WorkbenchView: View {
     @AppStorage("showUpcoming") private var showUpcoming = true
     @AppStorage("showDatedTasks") private var showDatedTasks = true
     @AppStorage("coloredBanner") private var coloredBanner = true
+    @AppStorage("keepInMenuBarOnClose") private var keepInMenuBarOnClose = true
     @AppStorage("workbenchTheme") private var themeName = WorkbenchTheme.ocean.rawValue
     private var theme: WorkbenchTheme { WorkbenchTheme(rawValue: themeName) ?? .ocean }
     @State private var confirmReplacement = false
@@ -412,10 +481,11 @@ private struct WorkbenchView: View {
             Group {
                 switch app.page {
                 case .courses:
-                    CampusWeek(schedule: schedule)
+                    CampusWeek(schedule: schedule, desktopAgendaVisible: app.desktopAgendaVisible, toggleDesktopAgenda: { app.toggleDesktopAgenda?() })
                 case .todos:
                     VStack(alignment: .leading, spacing: 18) {
-                        Text("待办事项").font(.system(size: 29, weight: .semibold))
+                        Text("待办事项").font(.system(size: 27, weight: .semibold))
+                            .foregroundStyle(WorkbenchPalette.ink).accessibilityAddTraits(.isHeader)
                         TodoView(model: schedule)
                     }.frame(maxWidth: 890).padding(22).frame(maxWidth: .infinity, alignment: .center)
                 case .vpn:
@@ -423,7 +493,7 @@ private struct WorkbenchView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            Divider()
+            Rectangle().fill(WorkbenchPalette.line).frame(height: 1)
             tabs
                 .overlay(alignment: .leading) {
                     Button {
@@ -441,20 +511,16 @@ private struct WorkbenchView: View {
                     Button { settings = true } label: {
                         Image(systemName: "gearshape").font(.system(size: 16, weight: .semibold))
                             .frame(width: 36, height: 36)
-                    }.buttonStyle(.plain).accessibilityLabel("工作台设置").help("工作台设置")
+                    }.buttonStyle(WorkbenchButton(kind: .icon, tint: theme.tint)).accessibilityLabel("工作台设置").help("工作台设置")
                         .padding(.trailing, 16)
                 }
         }
         .frame(minWidth: 735, minHeight: 510)
-        .background {
-            ZStack {
-                VisualEffectSurface()
-                LinearGradient(colors: [theme.tint.opacity(0.18), theme.tint.opacity(0.05), .clear],
-                               startPoint: .topLeading, endPoint: .bottomTrailing)
-            }.ignoresSafeArea()
-        }
+        .background(WorkbenchPalette.canvas.ignoresSafeArea())
         .sheet(isPresented: $settings) { settingsPage }
-        .sheet(isPresented: $addRoute) { addRoutePage }
+        .sheet(isPresented: $showCampusNotices) { CampusNoticesView() }
+        .sheet(isPresented: $showCampusOffice) { CampusOfficeView() }
+        .sheet(isPresented: $app.showAddRoute) { addRoutePage.onAppear { routeInput = ""; routeProblem = nil } }
         .confirmationDialog("接管这个账号的 VPN 会话？", isPresented: $confirmReplacement) {
             Button("剔除旧会话并连接", role: .destructive) { app.connect(replaceExisting: true) }
             Button("取消", role: .cancel) {}
@@ -495,37 +561,32 @@ private struct WorkbenchView: View {
     }
 
     private var tabs: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 5) {
             ForEach(Page.allCases, id: \.self) { page in
+                let selected = app.page == page
                 Button { app.page = page } label: {
-                    VStack(spacing: 4) {
-                        Image(systemName: page.symbol).font(.system(size: 16, weight: .medium))
-                        Text(page.title).font(.system(size: 13, weight: .semibold))
-                    }
-                    .foregroundStyle(app.page == page ? Color.teal : .secondary)
-                    .frame(maxWidth: .infinity, minHeight: 48)
-                    .background {
-                        if app.page == page {
-                            RoundedRectangle(cornerRadius: 10).fill(theme.tint.opacity(0.16))
-                        }
-                    }
-                    .contentShape(Rectangle())
+                    Label(page.title, systemImage: page.symbol)
+                        .font(.system(size: 14, weight: selected ? .semibold : .medium))
+                        .foregroundStyle(selected ? theme.tint : WorkbenchPalette.muted)
+                        .frame(minWidth: 105, minHeight: 36)
+                        .background(selected ? theme.tint.opacity(0.10) : .clear,
+                                    in: RoundedRectangle(cornerRadius: 7))
+                        .contentShape(Rectangle())
                 }.buttonStyle(.plain)
-                    .accessibilityAddTraits(app.page == page ? .isSelected : [])
+                    .accessibilityAddTraits(selected ? .isSelected : [])
             }
         }
-        .frame(width: 322)
-        .padding(4)
-        .modifier(WorkbenchGlass(radius: 18))
-        .padding(.vertical, 7)
+        .padding(3)
+        .background(WorkbenchPalette.inset, in: RoundedRectangle(cornerRadius: 10))
+        .padding(.vertical, 8)
         .frame(maxWidth: .infinity)
-        .background(.thinMaterial)
+        .background(WorkbenchPalette.surface)
     }
 
     private var settingsPage: some View {
         VStack(alignment: .leading, spacing: 17) {
-            Label("工作台设置", systemImage: "gearshape").font(.system(size: 25, weight: .semibold))
-                .foregroundStyle(theme.tint)
+            Text("工作台设置").font(.system(size: 25, weight: .semibold))
+                .foregroundStyle(WorkbenchPalette.ink)
             HStack(alignment: .top, spacing: 18) {
                 VStack(spacing: 6) {
                     ForEach([("通用", "slider.horizontal.3"), ("课程", "calendar"),
@@ -539,16 +600,21 @@ private struct WorkbenchView: View {
                         }.buttonStyle(.plain)
                             .accessibilityAddTraits(settingsSection == item.0 ? .isSelected : [])
                     }
-                }.frame(width: 108)
+                }.frame(width: 112).padding(7)
+                    .background(WorkbenchPalette.inset, in: RoundedRectangle(cornerRadius: 10))
                 ScrollView {
                     VStack(alignment: .leading, spacing: 15) {
-                        Text(settingsSection).font(.system(size: 20, weight: .semibold))
+                        Text(settingsSection).font(.system(size: 22, weight: .semibold))
                         switch settingsSection {
                         case "网络":
-                            Toggle("分流校园子网", isOn: $app.broad)
+                            settingsSwitch("连接异常时自动重试", isOn: $app.retryKeepalive)
+                            Text("短时网络异常时，保持 VPN 并重试。")
+                                .font(.subheadline).foregroundStyle(.secondary)
+                            Divider()
+                            settingsSwitch("校园网段走 VPN", isOn: $app.broad)
                                 .onChange(of: app.broad) { UserDefaults.standard.set($0, forKey: "broadVPN") }
-                            Toggle("校园认证门户走 VPN", isOn: $app.includePortal)
-                            Text("网络设置在下次连接时生效。").foregroundStyle(.secondary)
+                            settingsSwitch("校园自助服务走 VPN", isOn: $app.includePortal)
+                            Text("更改将在下次连接时生效。").foregroundStyle(.secondary)
                             Text("额外设备").font(.headline)
                             HStack {
                                 TextField("10.x.x.x", text: $host)
@@ -576,8 +642,9 @@ private struct WorkbenchView: View {
                                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { termSettings = true }
                                 }
                             }
-                            Toggle("显示下一堂课横幅", isOn: $showUpcoming)
-                            Toggle("显示带日期的待办", isOn: $showDatedTasks)
+                            settingsSwitch("显示下一堂课", isOn: $showUpcoming)
+                            settingsSwitch("突出下一堂课", isOn: $coloredBanner)
+                            settingsSwitch("显示带日期的待办", isOn: $showDatedTasks)
                             HStack {
                                 Button("管理调课") {
                                     settings = false
@@ -586,47 +653,87 @@ private struct WorkbenchView: View {
                                 Button("导出日历") { exportCalendar(schedule) }
                             }
                         case "导入":
-                            Picker("读取网页的浏览器", selection: $app.browser) {
+                            Picker("默认浏览器", selection: $app.browser) {
                                 ForEach(YNUBrowserBridge.Browser.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                             }
-                            Toggle("打开工作台或连接 VPN 时自动同步", isOn: $app.syncOnConnect)
+                            settingsSwitch("自动同步已打开的学校网页", isOn: $app.syncOnConnect)
                             TextField("教师课表网址（可选）", text: $teacherScheduleURL)
                             if !teacherScheduleURL.isEmpty && YNUBrowserBridge.courseImportURL(teacherScheduleURL) == nil {
                                 Text("请输入 https://ehall.ynu.edu.cn 下的课表地址。").foregroundStyle(.red)
                             }
-                            Toggle("每 30 秒后台刷新已打开的在线设备页", isOn: $app.automaticImport)
-                            Text("工作台只读取已打开的云大教务和自助服务页。首次使用需要由你在浏览器允许来自 Apple 事件的 JavaScript，并同意 macOS 的自动化授权。")
+                            settingsSwitch("定期更新在线设备", isOn: $app.automaticImport)
+                            Text("同步需要你先打开并登录学校网页，首次使用可能需要允许工作台读取浏览器。")
                                 .foregroundStyle(.secondary)
                         default:
-                            Picker("外观", selection: $app.appearance) {
-                                ForEach(WorkbenchAppearance.allCases, id: \.self) { Text($0.rawValue).tag($0) }
-                            }.pickerStyle(.segmented)
-                            Picker("启动页面", selection: $startPage) {
-                                ForEach(Page.allCases, id: \.self) { Text($0.title).tag($0.rawValue) }
+                            settingsRow("外观") {
+                                Picker("外观", selection: $app.appearance) {
+                                    ForEach(WorkbenchAppearance.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                                }.pickerStyle(.segmented).labelsHidden().frame(width: 234)
                             }
-                            Picker("主题色", selection: $themeName) {
+                            settingsRow("启动页面") {
+                                Picker("启动页面", selection: $startPage) {
+                                    ForEach(Page.allCases, id: \.self) { Text($0.title).tag($0.rawValue) }
+                                }.labelsHidden().frame(width: 140)
+                            }
+                            Divider()
+                            Text("主题色").font(.system(size: 15, weight: .semibold))
+                            HStack(spacing: 8) {
                                 ForEach(WorkbenchTheme.allCases, id: \.rawValue) { option in
-                                    Label(option.rawValue, systemImage: "circle.fill")
-                                        .foregroundStyle(option.tint).tag(option.rawValue)
+                                    let selected = themeName == option.rawValue
+                                    Button { themeName = option.rawValue } label: {
+                                        VStack(spacing: 7) {
+                                            ZStack {
+                                                RoundedRectangle(cornerRadius: 8).fill(option.tint)
+                                                if selected {
+                                                    Image(systemName: "checkmark").foregroundStyle(.white).fontWeight(.bold)
+                                                }
+                                            }.frame(height: 28)
+                                            Text(option.rawValue).font(.system(size: 12, weight: .medium))
+                                                .foregroundStyle(.primary).fixedSize()
+                                        }.padding(7).frame(maxWidth: .infinity)
+                                            .background(option.tint.opacity(selected ? 0.13 : 0),
+                                                        in: RoundedRectangle(cornerRadius: 10))
+                                            .overlay { RoundedRectangle(cornerRadius: 10)
+                                                .strokeBorder(option.tint.opacity(selected ? 0.65 : 0.18)) }
+                                    }.buttonStyle(.plain)
+                                        .accessibilityAddTraits(selected ? .isSelected : [])
                                 }
                             }
-                            Toggle("显示彩色横幅", isOn: $coloredBanner)
+                            Divider()
+                            settingsSwitch("关闭窗口后留在菜单栏", isOn: $keepInMenuBarOnClose)
                         }
-                    }.frame(maxWidth: .infinity, alignment: .leading).padding(17)
-                }.background(.thinMaterial, in: RoundedRectangle(cornerRadius: 13))
+                    }
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(17)
+                }.modifier(WorkbenchSurface())
             }
-            HStack { Spacer(); Button("完成") { settings = false }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction) }
-        }.padding(23).frame(width: 620, height: 435)
+            HStack { Spacer(); Button("完成") { settings = false }.buttonStyle(WorkbenchButton(kind: .primary, tint: theme.tint)).keyboardShortcut(.defaultAction) }
+        }.padding(25).frame(width: 670, height: 490)
+            .background(WorkbenchPalette.canvas)
+    }
+
+    private func settingsRow<Content: View>(_ title: String, @ViewBuilder control: () -> Content) -> some View {
+        HStack(spacing: 12) {
+            Text(title).foregroundStyle(WorkbenchPalette.ink)
+                .accessibilityHidden(true)
+            Spacer(minLength: 12)
+            control()
+        }.frame(minHeight: 32)
+    }
+
+    private func settingsSwitch(_ title: String, isOn: Binding<Bool>) -> some View {
+        settingsRow(title) {
+            Toggle(title, isOn: isOn).labelsHidden().toggleStyle(.switch)
+        }
     }
 
     private var routingCard: some View {
         let visible = app.routes.filter { !DPCampusPolicy.portalDestinations.contains($0) }
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Label("校园分流", systemImage: "point.topleft.down.to.point.bottomright.curvepath").font(.system(size: 18, weight: .semibold))
+                Label("VPN 连接范围", systemImage: "point.topleft.down.to.point.bottomright.curvepath").font(.system(size: 18, weight: .semibold))
                 Spacer()
-                Button { routeInput = ""; routeProblem = nil; addRoute = true } label: {
-                    Label("添加路由", systemImage: "plus")
+                Button { routeInput = ""; routeProblem = nil; app.showAddRoute = true } label: {
+                    Label("添加地址", systemImage: "plus")
                 }
             }
             if !visible.isEmpty {
@@ -636,17 +743,17 @@ private struct WorkbenchView: View {
             }
             if !routeMessage.isEmpty { Text(routeMessage).font(.callout).foregroundStyle(.secondary) }
         }.frame(maxWidth: .infinity, alignment: .leading).padding(16)
-            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
+            .modifier(WorkbenchSurface())
     }
 
     private var addRoutePage: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("添加校园路由").font(.title2.bold())
+            Text("添加校园地址").font(.title2.bold())
             TextField("学校网址或 10.x IPv4 地址", text: $routeInput)
             if let routeProblem { Text(routeProblem).foregroundStyle(.red) }
             HStack {
                 Spacer()
-                Button("取消") { addRoute = false }
+                Button("取消") { app.showAddRoute = false }
                 Button(resolvingRoute ? "正在解析…" : "添加") {
                     resolvingRoute = true
                     routeProblem = nil
@@ -660,7 +767,7 @@ private struct WorkbenchView: View {
                             guard new.count + app.extraHosts.count <= 8 else { routeProblem = "最多可添加 8 个额外地址。"; return }
                             for address in new { _ = app.addHost(address) }
                             routeMessage = "已添加 \(new.joined(separator: "、"))，下次连接生效。"
-                            addRoute = false
+                            app.showAddRoute = false
                         } catch { routeProblem = error.localizedDescription }
                     }
                 }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
@@ -669,7 +776,7 @@ private struct WorkbenchView: View {
         }.padding(23).frame(width: 445)
     }
 
-    @State private var showVPNControls = false
+
     @State private var revealVPNPassword = false
     @State private var revealedSavedPassword = ""
 
@@ -681,47 +788,123 @@ private struct WorkbenchView: View {
     private var vpn: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                Text("校内资源").font(.system(size: 29, weight: .semibold))
-                    .accessibilityAddTraits(.isHeader)
-                linksCard
-                VStack(alignment: .leading, spacing: 0) {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.18)) { showVPNControls.toggle() }
-                    } label: {
-                        HStack {
-                            Label("校园 VPN", systemImage: "lock.shield").font(.system(size: 17, weight: .semibold))
-                            Spacer()
-                            Text(app.state).foregroundStyle(.secondary)
-                            Image(systemName: showVPNControls ? "chevron.up" : "chevron.down").foregroundStyle(theme.tint)
-                        }.padding(.vertical, 5).frame(maxWidth: .infinity).contentShape(Rectangle())
-                    }.buttonStyle(.plain).accessibilityValue(showVPNControls ? "已展开" : "已折叠")
-                    if showVPNControls {
-                        VStack(spacing: 14) {
-                            if app.busy {
-                                vpnStatus.padding(20).modifier(WorkbenchGlass(radius: 20))
-                            } else {
-                                VStack(spacing: 19) {
-                                    HStack(spacing: 10) {
-                                        Image(systemName: "lock.shield").foregroundStyle(theme.tint)
-                                        Text("连接校园 VPN").fontWeight(.semibold)
-                                    }.font(.system(size: 22))
-                                    vpnCredentials
-                                }
-                                .frame(maxWidth: .infinity)
-                                .padding(22).modifier(WorkbenchGlass(radius: 20))
-                            }
-                            routingCard
-                        }.padding(.top, 12)
+                HStack {
+                    Text("校内资源").font(.system(size: 27, weight: .semibold)).foregroundStyle(WorkbenchPalette.ink)
+                        .accessibilityAddTraits(.isHeader)
+                    Spacer()
+                    Button { showCampusOffice = true } label: {
+                        Label("办事速查", systemImage: "building.2")
+                    }.buttonStyle(WorkbenchButton(kind: .primary, tint: theme.tint))
+                    Button { showCampusNotices = true } label: {
+                        Label("校内通知", systemImage: "newspaper")
+                    }.buttonStyle(WorkbenchButton(kind: .secondary, tint: theme.tint))
+                }
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .top, spacing: 16) {
+                        linksCard.frame(minWidth: 375)
+                        networkColumn.frame(minWidth: 420)
+                    }
+                    VStack(spacing: 14) {
+                        linksCard
+                        networkColumn
                     }
                 }
-                .padding(16).modifier(WorkbenchGlass(radius: 16))
-                devicesCard
             }
-            .onAppear { showVPNControls = app.busy || app.error != nil }
-            .frame(maxWidth: 890, alignment: .leading).frame(maxWidth: .infinity)
+            .onAppear {
+                if app.busy || app.error != nil { app.showVPNControls = true }
+            }
+            .frame(maxWidth: 1040, alignment: .leading).frame(maxWidth: .infinity)
             .padding(22)
         }
     }
+
+    private var networkColumn: some View {
+        VStack(spacing: 12) {
+            vpnConnectionCard
+            VStack(alignment: .leading, spacing: 9) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) { showNetworkDetails.toggle() }
+                } label: {
+                    HStack {
+                        Label("在线设备与测速", systemImage: "speedometer")
+                            .font(.system(size: 16, weight: .semibold))
+                        Spacer()
+                        if let report = app.networkReport {
+                            Text(report.shortResult).font(.callout).foregroundStyle(WorkbenchPalette.muted)
+                        }
+                        Image(systemName: showNetworkDetails ? "chevron.up" : "chevron.down")
+                            .foregroundStyle(theme.tint)
+                    }.padding(.vertical, 5).contentShape(Rectangle())
+                }.buttonStyle(.plain).accessibilityValue(showNetworkDetails ? "已展开" : "已折叠")
+                if showNetworkDetails {
+                    Rectangle().fill(WorkbenchPalette.line).frame(height: 1)
+                    devicesCard
+                    Rectangle().fill(WorkbenchPalette.line).frame(height: 1)
+                    networkTools
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading)
+                .padding(16).modifier(WorkbenchSurface())
+        }
+    }
+
+    private var vpnConnectionCard: some View {
+    VStack(alignment: .leading, spacing: 0) {
+        Button {
+            withAnimation(.easeInOut(duration: 0.18)) { app.showVPNControls.toggle() }
+        } label: {
+            HStack {
+                Label("校园 VPN", systemImage: "lock.shield").font(.system(size: 17, weight: .semibold))
+                Spacer()
+                Text(app.state).foregroundStyle(.secondary)
+                Image(systemName: app.showVPNControls ? "chevron.up" : "chevron.down").foregroundStyle(theme.tint)
+            }.padding(.vertical, 5).frame(maxWidth: .infinity).contentShape(Rectangle())
+        }.buttonStyle(.plain).accessibilityValue(app.showVPNControls ? "已展开" : "已折叠")
+        if app.showVPNControls {
+            VStack(spacing: 14) {
+                if app.busy {
+                    vpnStatus.padding(16).background(WorkbenchPalette.inset, in: RoundedRectangle(cornerRadius: 10))
+                } else {
+                    VStack(spacing: 19) {
+                        HStack(spacing: 10) {
+                            Image(systemName: "lock.shield").foregroundStyle(theme.tint)
+                            Text("连接校园 VPN").fontWeight(.semibold)
+                        }.font(.system(size: 22))
+                        vpnCredentials
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(19).background(WorkbenchPalette.inset, in: RoundedRectangle(cornerRadius: 10))
+                }
+                routingCard
+            }.padding(.top, 12)
+        }
+    }
+    .padding(16).modifier(WorkbenchSurface())
+    }
+
+    private var networkTools: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                Text("网络测速").font(.system(size: 15, weight: .semibold))
+                Spacer()
+                if let report = app.networkReport {
+                    Button("复制诊断") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(report.summary, forType: .string)
+                    }.buttonStyle(.borderless)
+                }
+                Button(app.testingNetwork ? "测速中…" : "开始测速") { app.testNetwork() }
+                    .buttonStyle(WorkbenchButton(kind: .secondary, tint: theme.tint))
+                    .disabled(app.testingNetwork)
+            }
+            if let report = app.networkReport {
+                Text(report.summary).foregroundStyle(.secondary).textSelection(.enabled)
+            } else {
+                Text("用约 4 MB 测外网下载速度，同时检查校内连接。").foregroundStyle(.secondary)
+            }
+        }.frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 5)
+    }
+
     private var vpnStatus: some View {
         HStack(alignment: .center, spacing: 15) {
             Image(systemName: app.routes.isEmpty ? "lock.shield" : "checkmark.shield.fill")
@@ -729,7 +912,7 @@ private struct WorkbenchView: View {
                 .frame(width: 54, height: 54)
                 .background(theme.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 15))
             VStack(alignment: .leading, spacing: 4) {
-                Text("校园 VPN").font(.system(size: 30, weight: .semibold))
+                Text("校园 VPN").font(.system(size: 22, weight: .semibold))
                 Text(app.state).font(.system(size: 15, weight: .semibold)).foregroundStyle(.secondary)
             }
             Spacer()
@@ -797,7 +980,8 @@ private struct WorkbenchView: View {
                     }
                 Spacer()
                 Button("连接 VPN") { hideVPNPassword(); app.connect() }
-                    .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                    .buttonStyle(WorkbenchButton(kind: .primary, tint: theme.tint))
+                    .keyboardShortcut(.defaultAction)
             }
             if let error = app.error {
                 Text(error).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
@@ -819,21 +1003,21 @@ private struct WorkbenchView: View {
             Text(label).font(.system(size: 15, weight: .semibold)).foregroundStyle(.primary)
             content()
                 .padding(.horizontal, 10).frame(minHeight: 39)
-                .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 9))
-                .overlay { RoundedRectangle(cornerRadius: 9).strokeBorder(theme.tint.opacity(0.15)).allowsHitTesting(false) }
+                .background(WorkbenchPalette.surface, in: RoundedRectangle(cornerRadius: 8))
+                .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(WorkbenchPalette.line).allowsHitTesting(false) }
         }
     }
 
     private var devicesCard: some View {
         VStack(alignment: .leading, spacing: 11) {
             HStack {
-                Label("在线设备", systemImage: "desktopcomputer").font(.system(size: 18, weight: .semibold))
+                Text("在线设备").font(.system(size: 15, weight: .semibold))
                 Spacer()
-                Button("打开校园认证") {
+                Button("打开自助服务") {
                     YNUBrowserBridge.openLinkedPage(YNUBrowserBridge.portalIP, browser: app.browser)
-                }
+                }.buttonStyle(WorkbenchButton(kind: .secondary, tint: theme.tint))
                 Button(app.importing ? "正在读取…" : "同步设备") { app.importDevices() }
-                    .buttonStyle(.borderedProminent).disabled(app.importing)
+                    .buttonStyle(WorkbenchButton(kind: .primary, tint: theme.tint)).disabled(app.importing)
             }
             HStack {
                 Toggle("后台自动同步", isOn: $app.automaticImport)
@@ -859,12 +1043,12 @@ private struct WorkbenchView: View {
                     }
                     Spacer()
                     if !device.name.isEmpty { Text(device.address).monospaced().foregroundStyle(.secondary) }
-                    Button(app.extraHosts.contains(device.address) ? "已添加" : "加入分流") {
-                        if app.addHost(device.address) { app.deviceMessage = "下次连接时启用新增分流。" }
+                    Button(app.extraHosts.contains(device.address) ? "已添加" : "走 VPN") {
+                        if app.addHost(device.address) { app.deviceMessage = "新地址将在下次连接时生效。" }
                     }.disabled(app.extraHosts.contains(device.address) || YNUBrowserBridge.privateAddress(device.address) == nil)
                 }
             }
-        }.padding(17).background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        }.padding(.vertical, 5)
     }
 
     private var linksCard: some View {
@@ -874,22 +1058,28 @@ private struct WorkbenchView: View {
                 Spacer()
                 Button("编辑") { schedule.showServices = true }.buttonStyle(.borderless)
             }
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 145), spacing: 9)], alignment: .leading, spacing: 9) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: 8)], alignment: .leading, spacing: 8) {
                 ForEach(schedule.services) { link in
                     Button { schedule.openService(link) } label: {
-                        VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 9) {
                             Image(systemName: link.symbol)
-                                .font(.system(size: 24, weight: .medium)).foregroundStyle(theme.tint)
-                            Text(link.name).font(.system(size: 15, weight: .semibold)).lineLimit(1)
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundStyle(theme.tint)
+                                .frame(width: 29, height: 29)
+                                .background(theme.tint.opacity(0.09), in: RoundedRectangle(cornerRadius: 6))
+                            Text(link.name).font(.system(size: 14, weight: .medium)).lineLimit(1)
+                                .foregroundStyle(WorkbenchPalette.ink)
+                            Spacer(minLength: 3)
+                            Image(systemName: "arrow.up.right").font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(WorkbenchPalette.muted)
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 11))
-                        .contentShape(RoundedRectangle(cornerRadius: 11))
-                    }.buttonStyle(.plain)
+                        .padding(.horizontal, 9).padding(.vertical, 7)
+                        .background(WorkbenchPalette.inset.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
+                        .contentShape(Rectangle())
+                    }.buttonStyle(.plain).help(link.name)
                 }
             }
-        }.padding(17).background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        }.padding(17).modifier(WorkbenchSurface())
     }
 
 }
@@ -942,37 +1132,17 @@ private struct VPNPasswordField: NSViewRepresentable {
     }
 }
 
-struct WorkbenchGlass: ViewModifier {
-    let radius: CGFloat
-
-    func body(content: Content) -> some View {
-        if #available(macOS 26.0, *) {
-            content.glassEffect(.regular, in: RoundedRectangle(cornerRadius: radius))
-        } else {
-            content.background(.regularMaterial, in: RoundedRectangle(cornerRadius: radius))
-        }
-    }
-}
-
-private struct VisualEffectSurface: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
-        view.material = .contentBackground
-        view.blendingMode = .withinWindow
-        view.state = .followsWindowActiveState
-        return view
-    }
-    func updateNSView(_ view: NSVisualEffectView, context: Context) {}
-}
-
 @MainActor
-final class DPMenuApp: NSObject, NSApplicationDelegate {
+final class DPMenuApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let model = Workbench()
     private var window: NSWindow?
     private var statusLabel: NSMenuItem?
     private var importTimer: Timer?
     private var vpnAction: NSMenuItem?
+    private var speedAction: NSMenuItem?
+    private var agendaAction: NSMenuItem?
+    private var desktopPanel: NSPanel?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         model.appearance.apply()
@@ -998,17 +1168,42 @@ final class DPMenuApp: NSObject, NSApplicationDelegate {
         image.isTemplate = true
         image.accessibilityDescription = "云大工作台"
         status.button?.image = image
+        status.isVisible = true
         let menu = NSMenu()
+        menu.autoenablesItems = false
         statusLabel = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
         add("打开云大工作台", #selector(openWorkbench), to: menu)
+        agendaAction = add("显示桌面课表", #selector(toggleDesktopAgenda), to: menu)
+        model.toggleDesktopAgenda = { [weak self] in self?.toggleDesktopAgenda() }
         vpnAction = add("连接 VPN…", #selector(toggleVPN), to: menu)
+        let networkMenu = NSMenu()
+        networkMenu.autoenablesItems = false
+        speedAction = add("测速", #selector(testNetwork), to: networkMenu)
+        add("添加 VPN 地址…", #selector(addCampusRoute), to: networkMenu)
+        let networkItem = menu.addItem(withTitle: "网络工具", action: nil, keyEquivalent: "")
+        networkItem.submenu = networkMenu
         menu.addItem(.separator())
         add("退出云大工作台", #selector(quit), to: menu).keyEquivalent = "q"
         status.menu = menu
         model.changed = { [weak self] in self?.updateMenu() }
         updateMenu()
         show(Page(rawValue: UserDefaults.standard.string(forKey: "startPage") ?? "") ?? .courses)
+        if UserDefaults.standard.bool(forKey: "showDesktopAgenda") { toggleDesktopAgenda() }
+    }
+
+    private var keepsRunningWhenClosed: Bool {
+        UserDefaults.standard.object(forKey: "keepInMenuBarOnClose") as? Bool ?? true
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard sender === window, keepsRunningWhenClosed else { return true }
+        sender.orderOut(nil)
+        return false
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        !keepsRunningWhenClosed
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -1027,6 +1222,12 @@ final class DPMenuApp: NSObject, NSApplicationDelegate {
         statusLabel?.title = "VPN  \(model.state)"
         status.button?.toolTip = "云大工作台 · VPN \(model.state)"
         vpnAction?.title = model.busy ? "断开 VPN" : "连接 VPN…"
+        agendaAction?.title = model.desktopAgendaVisible ? "隐藏桌面课表" : "显示桌面课表"
+        speedAction?.title = model.testingNetwork ? "测速中…" : model.networkReport.map { "测速 · " + $0.shortResult } ?? "测速"
+        speedAction?.isEnabled = !model.testingNetwork
+        if let result = model.networkReport {
+            status.button?.toolTip = "云大工作台 · VPN \(model.state) · \(result.shortResult)"
+        }
         status.button?.appearsDisabled = false
     }
 
@@ -1044,6 +1245,7 @@ final class DPMenuApp: NSObject, NSApplicationDelegate {
                                      styleMask: [.titled, .closable, .miniaturizable, .resizable],
                                      backing: .buffered, defer: false)
             newWindow.title = "云大工作台"
+            newWindow.delegate = self
             newWindow.isReleasedWhenClosed = false
             newWindow.isOpaque = true
             newWindow.backgroundColor = .windowBackgroundColor
@@ -1060,8 +1262,52 @@ final class DPMenuApp: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    @objc private func toggleDesktopAgenda() {
+        if model.desktopAgendaVisible {
+            desktopPanel?.orderOut(nil)
+        } else {
+            if desktopPanel == nil {
+                let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 328, height: 285),
+                                    styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+                panel.title = "桌面课表"
+                panel.isOpaque = false
+                panel.backgroundColor = .clear
+                panel.hasShadow = true
+                panel.hidesOnDeactivate = false
+                panel.isFloatingPanel = false
+                panel.isMovableByWindowBackground = true
+                panel.level = .init(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
+                panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+                panel.contentView = NSHostingView(rootView: DesktopAgenda(schedule: model.schedule,
+                    open: { [weak self] in self?.show(.courses) },
+                    close: { [weak self] in self?.toggleDesktopAgenda() }))
+                if let frame = (window?.screen ?? NSScreen.main)?.visibleFrame {
+                    panel.setFrameTopLeftPoint(NSPoint(x: frame.maxX - 365, y: frame.maxY - 25))
+                }
+                desktopPanel = panel
+            }
+            desktopPanel?.orderFrontRegardless()
+        }
+        model.desktopAgendaVisible.toggle()
+        UserDefaults.standard.set(model.desktopAgendaVisible, forKey: "showDesktopAgenda")
+        updateMenu()
+    }
+
+    @objc private func testNetwork() { model.testNetwork() }
+    @objc private func addCampusRoute() {
+        show(.vpn)
+        model.showAddRoute = true
+    }
+
     @objc private func openWorkbench() { show(model.page) }
-    @objc private func toggleVPN() { if model.busy { model.disconnect() } else { show(.vpn) } }
+    @objc private func toggleVPN() {
+        if model.busy {
+            model.disconnect()
+        } else {
+            model.showVPNControls = true
+            show(.vpn)
+        }
+    }
     @objc private func quit() {
         guard model.busy else { NSApp.terminate(nil); return }
         model.quitting = true

@@ -6,6 +6,7 @@ enum DPControlError: LocalizedError {
     case invalidHTTPResponse
     case unexpectedStatus(Int)
     case invalidSession(DPLoginRejection)
+    case invalidPayload(String)
     case emptyVersion
     case unauthorizedHost(String)
 
@@ -17,6 +18,7 @@ enum DPControlError: LocalizedError {
         case .unexpectedStatus(let status): return "The gateway returned HTTP \(status)."
         case .invalidSession(let result): return result.message
         case .unauthorizedHost(let host): return "学校网关未授权设备 \(host)。"
+        case .invalidPayload(let phase): return "学校网关返回了无法识别的\(phase)响应。"
         case .emptyVersion: return "The gateway did not return a version."
         }
     }
@@ -178,10 +180,15 @@ final class DPControl: @unchecked Sendable {
         return (data, response)
     }
 
+    private func decode<Value: Decodable>(_ type: Value.Type, from data: Data, phase: String) throws -> Value {
+        do { return try JSONDecoder().decode(type, from: data) }
+        catch { throw DPControlError.invalidPayload(phase) }
+    }
+
     func version(session: DPSession? = nil) async throws -> String {
         let (data, response) = try await send(request("sslvpn/action/VPNVersion", session: session))
         guard response.statusCode == 200 else { throw DPControlError.unexpectedStatus(response.statusCode) }
-        let version = try JSONDecoder().decode(DPVersion.self, from: data).ServerVersion
+        let version = try decode(DPVersion.self, from: data, phase: session == nil ? "版本查询" : "连接检查").ServerVersion
         guard !version.isEmpty else { throw DPControlError.emptyVersion }
         return version
     }
@@ -189,13 +196,14 @@ final class DPControl: @unchecked Sendable {
     func tunnelConfiguration(session: DPSession) async throws -> DPTunnelConfiguration {
         let (data, response) = try await send(request("sslvpn/action/TunnelInfo", session: session))
         guard response.statusCode == 200 else { throw DPControlError.unexpectedStatus(response.statusCode) }
-        return try JSONDecoder().decode(DPTunnelConfiguration.self, from: data)
+        return try decode(DPTunnelConfiguration.self, from: data, phase: "隧道配置")
     }
 
     func udpAssociations(session: DPSession) async throws -> DPUdpAssociations {
         let (data, response) = try await send(request("sslvpn/action/SAInfo", session: session))
         guard response.statusCode == 200 else { throw DPControlError.unexpectedStatus(response.statusCode) }
-        return try DPUdpAssociations(data: data)
+        do { return try DPUdpAssociations(data: data) }
+        catch { throw DPControlError.invalidPayload("隧道密钥配置") }
     }
 
     func endSession(_ session: DPSession) async throws {
@@ -212,7 +220,14 @@ final class DPControl: @unchecked Sendable {
     func campusPolicy(session: DPSession, virtualAddress: String, broad: Bool = false, extraHosts: [String] = [], includePortal: Bool = false) async throws -> DPCampusPolicy {
         let (data, response) = try await send(request("sslvpn/action/UserResource", session: session))
         guard response.statusCode == 200 else { throw DPControlError.unexpectedStatus(response.statusCode) }
-        return try DPCampusPolicy(data: data, virtualAddress: virtualAddress, broad: broad, extraHosts: extraHosts, includePortal: includePortal)
+        do {
+            return try DPCampusPolicy(data: data, virtualAddress: virtualAddress, broad: broad, extraHosts: extraHosts, includePortal: includePortal)
+        } catch let error as DPControlError {
+            if case .invalidHTTPResponse = error { throw DPControlError.invalidPayload("校园路由") }
+            throw error
+        } catch {
+            throw DPControlError.invalidPayload("校园路由")
+        }
     }
 
     func resourceSummary(session: DPSession, destination: String) async throws -> DPResourceMatch {
