@@ -214,9 +214,12 @@ private final class Workbench: ObservableObject {
         didSet { UserDefaults.standard.set(browser.rawValue, forKey: "browserChoice") }
     }
     @Published var error: String?
-    @Published var takeoverAvailable = false
-    @Published var canCheckOldSession = false
+    @Published private var duplicateSessionAccount: String?
+    var takeoverAvailable: Bool {
+        duplicateSessionAccount == account.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
     @Published var busy = false
+    private let pendingLogout = DPPendingLogout()
     private var worker: Task<Void, Never>?
     var changed: (() -> Void)?
     var quitting = false
@@ -230,10 +233,10 @@ private final class Workbench: ObservableObject {
 
     @discardableResult
     func connect(replaceExisting: Bool = false, savedPasswordOnly: Bool = false) -> Bool {
-        guard worker == nil, !savedPasswordOnly || canQuickConnect else { return false }
+        guard worker == nil, !savedPasswordOnly || canQuickConnect,
+              !replaceExisting || takeoverAvailable else { return false }
         let confirmedDuplicate = takeoverAvailable
-        takeoverAvailable = false
-        canCheckOldSession = false
+        duplicateSessionAccount = nil
         if !savedPasswordOnly { NSApp.keyWindow?.makeFirstResponder(nil) }
         let endpoint = server.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard [Self.gateway, Self.gateway + "/", "vpn.ynu.edu.cn", Self.gateway + ":443"].contains(endpoint) else {
@@ -266,7 +269,7 @@ private final class Workbench: ObservableObject {
         let connectingState = replaceExisting ? "正在接管并连接" : "正在连接"
         state = connectingState
         changed?()
-        worker = Task { [weak self] in
+        worker = Task { [weak self, pendingLogout] in
             var failures = 0
             while !Task.isCancelled {
                 let takeOver = failures == 0 && replaceExisting
@@ -275,7 +278,8 @@ private final class Workbench: ObservableObject {
                     try await DPKernelSession.run(username: username, password: secret, broad: useBroadRoutes,
                                                   extraHosts: selectedHosts, replaceExisting: takeOver,
                                                   confirmedDuplicate: takeOver && confirmedDuplicate, includePortal: routePortal,
-                                                  retryKeepalive: shouldRetry, health: { [weak self] health in
+                                                  retryKeepalive: shouldRetry, pendingLogout: pendingLogout,
+                                                  health: { [weak self] health in
                         self?.updateVPNHealth(health)
                     }) { [weak self] _, hosts in
                         guard let self, self.worker?.isCancelled == false else { return }
@@ -299,15 +303,16 @@ private final class Workbench: ObservableObject {
                 } catch DPControlError.invalidSession(let rejection) {
                     guard !Task.isCancelled else { break }
                     let duplicateSession = rejection.reason == .duplicate
-                    let canCheck = duplicateSession || rejection.reason == .authentication || rejection.reason == .unknown
+                    let vendorCode = rejection.vendorCode.map { String($0) } ?? "—"
+                    self?.vpnLog.info("登录被拒绝，HTTP \(rejection.status, privacy: .public)，DP \(vendorCode, privacy: .public)")
                     var failure = rejection.message
-                    if usedSavedPassword && rejection.reason != .duplicate && rejection.reason != .locked {
-                        failure = rejection.message + " 可以重新输入密码，覆盖钥匙串中的旧值。"
+                    if usedSavedPassword && (rejection.reason == .credential || rejection.reason == .authentication) {
+                        failure += " 本次使用了钥匙串中的密码。"
                     }
                     if takeOver && (confirmedDuplicate || duplicateSession) {
                         failure = "网关未完成旧会话接管。\(failure)"
                     }
-                    self?.finished(failure, duplicateSession: duplicateSession, canCheck: canCheck)
+                    self?.finished(failure, duplicateSessionAccount: duplicateSession ? username : nil)
                     return
                 } catch {
                     guard !Task.isCancelled else { break }
@@ -506,9 +511,8 @@ private final class Workbench: ObservableObject {
         worker.cancel()
     }
 
-    private func finished(_ failure: String?, duplicateSession: Bool = false, canCheck: Bool = false) {
-        takeoverAvailable = duplicateSession
-        canCheckOldSession = canCheck
+    private func finished(_ failure: String?, duplicateSessionAccount: String? = nil) {
+        self.duplicateSessionAccount = duplicateSessionAccount
         worker = nil
         busy = false
         vpnHealth = nil
@@ -1061,8 +1065,8 @@ private struct WorkbenchView: View {
             }
             if let error = app.error {
                 Text(error).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
-                if app.canCheckOldSession {
-                    Button(app.takeoverAvailable ? "剔除旧会话并连接…" : "检查并接管旧会话…") {
+                if app.takeoverAvailable {
+                    Button("剔除旧会话并连接…") {
                         hideVPNPassword()
                         confirmReplacement = true
                     }.buttonStyle(.borderless)

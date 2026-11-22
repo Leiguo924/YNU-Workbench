@@ -113,7 +113,7 @@ enum DPReconnectPolicy {
     static func canRetry(_ error: Error) -> Bool {
         if let error = error as? DPControlError {
             switch error {
-            case .invalidSession, .unauthorizedHost, .invalidUsername, .invalidGateway: return false
+            case .invalidSession, .logoutRejected, .unauthorizedHost, .invalidUsername, .invalidGateway: return false
             case .unexpectedStatus(let code): return code == 408 || (500..<600).contains(code)
             default: return true
             }
@@ -155,11 +155,14 @@ enum DPKernelSession {
 
     static func run(
         username: String, password: String, broad: Bool = false, extraHosts: [String] = [], replaceExisting: Bool = false, confirmedDuplicate: Bool = false, includePortal: Bool = false, retryKeepalive: Bool = true,
+        pendingLogout: DPPendingLogout = DPPendingLogout(),
         health: @escaping @MainActor @Sendable (DPTunnelHealth) -> Void = { _ in },
         ready: @escaping @MainActor @Sendable (String, [String]) -> Void
     ) async throws {
         guard FileManager.default.fileExists(atPath: helperSocket) else { throw DPKernelError.noHelper }
         let gateway = try DPControl(origin: origin)
+        try await pendingLogout.finish(using: gateway)
+        try Task.checkCancellation()
         let session = try await gateway.authenticate(username: username, password: password, replaceExisting: replaceExisting, confirmedDuplicate: confirmedDuplicate)
         do {
             try Task.checkCancellation()
@@ -226,11 +229,11 @@ enum DPKernelSession {
             }
         } catch {
             await health(.stopping)
-            let cleanup = Task.detached { try? await gateway.endSession(session, timeout: 2) }
+            let cleanup = Task.detached { await pendingLogout.close(session, using: gateway) }
             _ = await cleanup.value
             throw error
         }
-        try await gateway.endSession(session)
+        await pendingLogout.close(session, using: gateway)
     }
 
     private static func checkSession(_ gateway: DPControl, session: DPSession,

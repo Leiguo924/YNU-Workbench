@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 enum DPControlError: LocalizedError {
     case invalidGateway
@@ -6,6 +7,7 @@ enum DPControlError: LocalizedError {
     case invalidHTTPResponse
     case unexpectedStatus(Int)
     case invalidSession(DPLoginRejection)
+    case logoutRejected(Int)
     case invalidPayload(String)
     case emptyVersion
     case unauthorizedHost(String)
@@ -17,6 +19,7 @@ enum DPControlError: LocalizedError {
         case .invalidHTTPResponse: return "The gateway returned an invalid response."
         case .unexpectedStatus(let status): return "The gateway returned HTTP \(status)."
         case .invalidSession(let result): return result.message
+        case .logoutRejected(let code): return "学校网关未确认注销旧会话，已暂停重新登录（DP \(code)）。"
         case .unauthorizedHost(let host): return "学校网关未授权设备 \(host)。"
         case .invalidPayload(let phase): return "学校网关返回了无法识别的\(phase)响应。"
         case .emptyVersion: return "The gateway did not return a version."
@@ -44,11 +47,11 @@ struct DPLoginRejection {
         let html = String(decoding: body.prefix(32_768), as: UTF8.self)
         let pattern = #"(?i)\balert\(\s*["']([^"'<>]{1,180})["']\s*\)"#
         let match = html.range(of: pattern, options: .regularExpression).map { String(html[$0]).lowercased() } ?? ""
-        if vendorCode == 22 || query.contains(where: { $0.name == "repeat_login" && $0.value == "1" }) ||
+        if vendorCode == 8 || status == 429 || ["已锁定", "账户锁定", "account locked"].contains(where: { match.contains($0) }) {
+            reason = .locked
+        } else if vendorCode == 22 || query.contains(where: { $0.name == "repeat_login" && $0.value == "1" }) ||
             ["重复登录", "已在线", "already logged in", "concurrent session"].contains(where: { match.contains($0) }) {
             reason = .duplicate
-        } else if vendorCode == 8 || status == 429 || ["已锁定", "账户锁定", "account locked"].contains(where: { match.contains($0) }) {
-            reason = .locked
         } else if vendorCode == 2 || vendorCode == 3 || status == 401 || ["用户名或密码错误", "密码错误", "invalid credentials"].contains(where: { match.contains($0) }) {
             reason = .credential
         } else if vendorCode == 25 {
@@ -62,9 +65,9 @@ struct DPLoginRejection {
         let detail: String
         switch reason {
         case .duplicate: detail = "网关报告重复登录。请通过学校门户检查当前会话。"
-        case .locked: detail = "网关报告登录受限。请等待学校解除限制后再试。"
+        case .locked: detail = "学校网关暂时限制登录。请等 5–10 分钟后再试。"
         case .credential: detail = "网关拒绝了这次认证。请核对校园网上网账号和密码。"
-        case .authentication: detail = "迪普网关报告认证失败。请核对密码中的英文标点，或使用密码栏右侧的粘贴按钮。"
+        case .authentication: detail = "学校网关未通过这次认证，原因未明确。请避免连续重试。"
         case .unknown: detail = "网关没有发回 VPN 会话，也没有提供可识别的失败原因。"
         }
         let details = vendorCode.map { "HTTP \(status) · DP \($0)" } ?? "HTTP \(status)"
@@ -115,6 +118,31 @@ struct DPSession {
 
     func udpSynchronization() throws -> Data {
         try DPUdpProtocol.synchronizationDatagram(sessionID: cookie)
+    }
+}
+
+actor DPPendingLogout {
+    private var session: DPSession?
+    private let log = Logger(subsystem: "local.ynu.workbench", category: "VPN")
+
+    func close(_ session: DPSession, using gateway: DPControl) async {
+        self.session = session
+        do {
+            try await finish(using: gateway)
+        } catch {
+            log.info("旧会话注销未完成，将在重新登录前重试")
+        }
+    }
+
+    func finish(using gateway: DPControl) async throws {
+        guard let session else { return }
+        do {
+            try await gateway.endSession(session, timeout: 2)
+        } catch DPControlError.unexpectedStatus(let status) where status == 401 || status == 403 {
+            // The gateway no longer accepts the old session.
+        }
+        self.session = nil
+        log.info("旧会话已注销或已失效")
     }
 }
 
@@ -213,6 +241,9 @@ final class DPControl: @unchecked Sendable {
         guard (200..<400).contains(response.statusCode) else {
             throw DPControlError.unexpectedStatus(response.statusCode)
         }
+        if let code = vendorCode(in: response), code != 0 {
+            throw DPControlError.logoutRejected(code)
+        }
     }
 
     func keepalive(_ session: DPSession) async throws {
@@ -290,9 +321,7 @@ final class DPControl: @unchecked Sendable {
         login.httpMethod = "POST"
         login.httpBody = body
         let (data, response) = try await send(login)
-        let vendorCode = response.value(forHTTPHeaderField: "x-errcode").flatMap {
-            Int($0.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
+        let vendorCode = vendorCode(in: response)
         let rejection = DPLoginRejection(status: response.statusCode,
                                          location: response.value(forHTTPHeaderField: "Location"),
                                          body: data, vendorCode: vendorCode)
@@ -310,5 +339,11 @@ final class DPControl: @unchecked Sendable {
         }
         guard let cookie else { throw DPControlError.invalidSession(rejection) }
         return DPSession(cookie: cookie.value)
+    }
+
+    private func vendorCode(in response: HTTPURLResponse) -> Int? {
+        response.value(forHTTPHeaderField: "x-errcode").flatMap {
+            Int($0.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
     }
 }
