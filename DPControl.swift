@@ -127,8 +127,12 @@ actor DPPendingLogout {
 
     func close(_ session: DPSession, using gateway: DPControl) async {
         self.session = session
+        // The tunnel task can already be cancelled when it reaches logout.
+        let cleanup = Task.detached { try await self.finish(using: gateway) }
         do {
-            try await finish(using: gateway)
+            try await cleanup.value
+        } catch let error as URLError {
+            log.info("旧会话注销请求失败（网络错误 \(error.code.rawValue, privacy: .public)），将在重新登录前重试")
         } catch {
             log.info("旧会话注销未完成，将在重新登录前重试")
         }

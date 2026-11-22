@@ -229,8 +229,7 @@ enum DPKernelSession {
             }
         } catch {
             await health(.stopping)
-            let cleanup = Task.detached { await pendingLogout.close(session, using: gateway) }
-            _ = await cleanup.value
+            await pendingLogout.close(session, using: gateway)
             throw error
         }
         await pendingLogout.close(session, using: gateway)

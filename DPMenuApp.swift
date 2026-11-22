@@ -1215,6 +1215,7 @@ private struct VPNPasswordField: NSViewRepresentable {
 @MainActor
 final class DPMenuApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     private let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    private let lifecycleLog = Logger(subsystem: "local.ynu.workbench", category: "Window")
     private let model = Workbench()
     private var window: NSWindow?
     private var statusLabel: NSMenuItem?
@@ -1261,13 +1262,23 @@ final class DPMenuApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        guard sender === window, keepsRunningWhenClosed else { return true }
-        sender.orderOut(nil)
+        guard sender === window else { return true }
+        closeWorkbenchWindow()
         return false
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        !keepsRunningWhenClosed
+        false
+    }
+
+    @objc private func closeWorkbenchWindow() {
+        guard keepsRunningWhenClosed else {
+            quit()
+            return
+        }
+        window?.orderOut(nil)
+        status.isVisible = true
+        lifecycleLog.info("主窗口已隐藏，工作台继续在菜单栏运行")
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -1328,6 +1339,10 @@ final class DPMenuApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
             newWindow.contentMinSize = NSSize(width: 735, height: 510)
             newWindow.center()
             newWindow.setFrameAutosaveName("YNUWorkbenchMain")
+            if let closeButton = newWindow.standardWindowButton(.closeButton) {
+                closeButton.target = self
+                closeButton.action = #selector(closeWorkbenchWindow)
+            }
             window = newWindow
         }
         window?.makeKeyAndOrderFront(nil)
@@ -1395,6 +1410,6 @@ struct DPMenuMain {
         app.setActivationPolicy(.regular)
         let delegate = DPMenuApp()
         app.delegate = delegate
-        app.run()
+        withExtendedLifetime(delegate) { app.run() }
     }
 }
